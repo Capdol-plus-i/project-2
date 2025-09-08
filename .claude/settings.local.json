@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
