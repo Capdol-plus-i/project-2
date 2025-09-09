@@ -5,7 +5,18 @@
       "Bash(pip install:*)",
       "Bash(python:*)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(pip3:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(sudo apt-get install:*)",
+      "Bash(conda install:*)",
+      "Bash(mamba install:*)",
+      "Read(//dev/**)",
+      "Bash(cat:*)",
+      "Bash(sudo usermod:*)",
+      "Bash(chmod:*)",
+      "Bash(curl:*)",
+      "Bash(pkill:*)"
     ],
     "deny": [],
     "ask": []

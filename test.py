@@ -1,20 +1,63 @@
+import os
+import sys
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except Exception as e:
+    msg = str(e)
+    if "MessageFactory" in msg and "GetPrototype" in msg:
+        print(
+            "mediapipe/protobuf version mismatch detected.\n"
+            "Fix: pin protobuf to 3.20.3 (or <4). For example:\n"
+            "  pip install --upgrade 'protobuf==3.20.3'\n"
+            "Optionally ensure mediapipe < 0.11 if needed."
+        )
+    else:
+        print(f"Failed to import mediapipe: {e}")
+    sys.exit(1)
 
 # MediaPipe Hands 솔루션 초기화
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     model_complexity=0,
     min_detection_confidence=0.5,
-    min_tracking_confidence=0.5)
+    min_tracking_confidence=0.5,
+)
 mp_drawing = mp.solutions.drawing_utils
 
-# 웹캠 열기
-cap = cv2.VideoCapture(1)
+def open_first_camera(preferred=(0, 1, 2, 3, 4)):
+    backends = []
+    # Prefer V4L2 on Linux
+    if os.name == 'posix':
+        backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+    else:
+        backends = [cv2.CAP_ANY]
 
-if not cap.isOpened():
-    print("카메라를 열 수 없습니다.")
-    exit()
+    for idx in preferred:
+        for be in backends:
+            cap = cv2.VideoCapture(idx, be)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            # sanity read
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 0:
+                print(f"Using camera index {idx} (backend {be})")
+                return cap
+            cap.release()
+    return None
+
+# 웹캠 열기 (자동 탐지)
+cap = open_first_camera()
+if cap is None:
+    print("카메라를 열 수 없습니다. 다른 인덱스/권한/점유 상태를 확인하세요.")
+    if os.name == 'posix':
+        # 간단한 힌트 제공 (사용자 시스템에서 실행 필요)
+        print("- 확인: ls /dev/video*  • v4l2-ctl --list-devices")
+        print("- 점유: fuser /dev/video0  • 권한: 사용자 video 그룹 여부")
+    sys.exit(1)
 
 while cap.isOpened():
     success, image = cap.read()

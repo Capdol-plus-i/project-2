@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jetson Single Camera WebRTC</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            text-align: center;
+        }
+        
+        h1 {
+            margin-bottom: 30px;
+        }
+        
+        .controls {
+            margin-bottom: 20px;
+        }
+        
+        .btn {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            margin: 0 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        .btn:hover {
+            background: #45a049;
+        }
+        
+        .btn:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .video-container {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        video {
+            width: 100%;
+            max-width: 800px;
+            height: auto;
+            border-radius: 10px;
+            background: #000;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            text-align: center;
+        }
+        
+        .status.connected { background: rgba(76, 175, 80, 0.3); }
+        .status.connecting { background: rgba(255, 193, 7, 0.3); }
+        .status.disconnected { background: rgba(244, 67, 54, 0.3); }
+        
+        .info {
+            background: rgba(255,255,255,0.1);
+            border-radius: 5px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 Jetson Single Camera WebRTC Stream</h1>
+        
+        <div class="controls">
+            <button class="btn" id="startBtn">📹 Start Stream</button>
+            <button class="btn" id="stopBtn" disabled>⏹ Stop</button>
+        </div>
+        
+        <div id="status" class="status disconnected">
+            📡 Not Connected
+        </div>
+        
+        <div class="video-container">
+            <video id="videoElement" autoplay muted playsinline controls></video>
+        </div>
+        
+        <div class="info">
+            <h3>📊 Stream Information</h3>
+            <p><strong>Resolution:</strong> <span id="resolution">-</span></p>
+            <p><strong>Status:</strong> <span id="streamStatus">Disconnected</span></p>
+            <p><strong>Camera ID:</strong> 0</p>
+        </div>
+    </div>
+
+    <script>
+        class SingleCameraWebRTC {
+            constructor() {
+                this.pc = null;
+                this.isConnected = false;
+                
+                this.startBtn = document.getElementById('startBtn');
+                this.stopBtn = document.getElementById('stopBtn');
+                this.statusDiv = document.getElementById('status');
+                this.video = document.getElementById('videoElement');
+                this.resolution = document.getElementById('resolution');
+                this.streamStatus = document.getElementById('streamStatus');
+                
+                this.startBtn.addEventListener('click', () => this.startStream());
+                this.stopBtn.addEventListener('click', () => this.stopStream());
+                
+                this.video.addEventListener('loadedmetadata', () => {
+                    this.resolution.textContent = `${this.video.videoWidth}x${this.video.videoHeight}`;
+                });
+                
+                this.checkServer();
+            }
+            
+            async checkServer() {
+                try {
+                    const response = await fetch('/status');
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('Server status:', data);
+                        this.updateStatus('Ready to connect', 'disconnected');
+                    }
+                } catch (error) {
+                    console.error('Server check failed:', error);
+                    this.updateStatus('Server unavailable', 'disconnected');
+                }
+            }
+            
+            async startStream() {
+                try {
+                    this.updateStatus('Connecting...', 'connecting');
+                    this.startBtn.disabled = true;
+                    
+                    // Create peer connection
+                    this.pc = new RTCPeerConnection({
+                        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                    });
+                    
+                    // Request a remote video track (recvonly) so the offer includes a video m-line
+                    this.pc.addTransceiver('video', { direction: 'recvonly' });
+
+                    // Handle remote stream
+                    this.pc.ontrack = (event) => {
+                        console.log('Received stream:', event.streams[0]);
+                        this.video.srcObject = event.streams[0];
+                        this.updateStatus('Connected - Streaming', 'connected');
+                        this.streamStatus.textContent = 'Connected';
+                        this.stopBtn.disabled = false;
+                    };
+                    
+                    // Handle connection state
+                    this.pc.onconnectionstatechange = () => {
+                        console.log('Connection state:', this.pc.connectionState);
+                        if (this.pc.connectionState === 'connected') {
+                            this.isConnected = true;
+                        } else if (this.pc.connectionState === 'failed') {
+                            this.updateStatus('Connection failed', 'disconnected');
+                            this.streamStatus.textContent = 'Failed';
+                        }
+                    };
+                    
+                    // Create offer
+                    const offer = await this.pc.createOffer();
+                    await this.pc.setLocalDescription(offer);
+                    
+                    // Send offer to server
+                    const response = await fetch('/offer', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            sdp: this.pc.localDescription.sdp,
+                            type: this.pc.localDescription.type
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to send offer');
+                    }
+                    
+                    const answer = await response.json();
+                    await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+                    
+                } catch (error) {
+                    console.error('Stream start failed:', error);
+                    this.updateStatus('Connection failed', 'disconnected');
+                    this.streamStatus.textContent = 'Failed';
+                    this.startBtn.disabled = false;
+                }
+            }
+            
+            stopStream() {
+                if (this.pc) {
+                    this.pc.close();
+                    this.pc = null;
+                }
+                
+                this.video.srcObject = null;
+                this.isConnected = false;
+                
+                this.updateStatus('Disconnected', 'disconnected');
+                this.streamStatus.textContent = 'Disconnected';
+                this.resolution.textContent = '-';
+                
+                this.startBtn.disabled = false;
+                this.stopBtn.disabled = true;
+            }
+            
+            updateStatus(message, className) {
+                this.statusDiv.textContent = `📡 ${message}`;
+                this.statusDiv.className = `status ${className}`;
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            new SingleCameraWebRTC();
+        });
+    </script>
+</body>
+</html>

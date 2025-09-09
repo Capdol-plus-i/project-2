@@ -19,7 +19,7 @@ BUTTON_POSITIONS = {0: 2124, 1: 3148}
 # Arduino Controller Configuration
 ARDUINO_CONFIG = {
     'enabled': True,
-    'port': 'COM4',
+    'port': '/dev/ttyACM0',
     'baudrate': 9600,
     'auto_detect': True,                # Try to auto-detect Arduino port
     'timeout': 1.0
@@ -29,13 +29,13 @@ ARDUINO_CONFIG = {
 ROBOT_ARMS_CONFIG = {
     'enabled': True,
     'follower': {
-        'port': 'COM5',
+        'port': '/dev/ttyACM1',
         'baudrate': 1000000,
         'motor_ids': [1, 2, 3, 4],
         'enabled': True
     },
     'leader': {
-        'port': 'COM3',
+        'port': '/dev/ttyACM2',
         'baudrate': 1000000,
         'motor_ids': [1],
         'enabled': True
@@ -48,13 +48,13 @@ ROBOT_ARMS_CONFIG = {
 CAMERA_CONFIG = {
     'enabled': True,                    # Enable/disable cameras
     'camera1': {
-        'id': 2,
+        'id': 0,
         'enabled': True,
         'width': 640,
         'height': 480
     },
     'camera2': {
-        'id': 3,
+        'id': 1,
         'enabled': True,
         'width': 640,
         'height': 480
