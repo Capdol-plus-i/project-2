@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "stone-bongo-472205-g5",
+  "private_key_id": "4adf6e1aaf74c152aa5239f14c4c16e0f7ab9237",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCaHCJtzw3Ild6S\nznGZ2JAlUh12tSkZvyH2wlB/lsmFZVxE0dkKbkv2YBGiBMwKKVhVgxeRmYGMm6VO\ntVbib3X0Y3epMeN8OwoameeXn71bfISbzPMji+VMekPkvJ6hatTaaSHST14iafwj\nx2GlBcTbwhqYpGwufYXI1YYGwmICyv4AWNJHIJUllRB9NOfqC5O/XU2xUNdmV/Kk\nbJ+EjmPns/xdFVQ3m1mL+ASc5LnnheljXTuGsqp8bH3R2xakm6jr1m4Jlq2ESFqu\n0BRYYX02H25yVzjhjzTHxDQ2E04VHqNA9J8FuMB/HT9aZjaR9VCsy1seHaWnCJAW\nJDUYFMfnAgMBAAECggEAKJmH4nj9bx44lGGJ4ReCJirjcz4X1V4awwj/LxXZAmkp\nLUJBlTNolMBLdO0hmf25dVHDeErCK/pnSvyQJrhpkVhREoR/o19kcoygTDw7pSoB\nP5B3b6Jv5r2BPHYKrojYCbBPxjm9mYBlekGRMmn6KlERM6yBiZ/tCnNiS06Thptt\n16vGDYan1B1n6uR5++LkJ6fjt1WJynsz7kNA9T6kydOnfOenIdhxG+2Av9m8ys+i\ne03SeY8b86fCfvgZ1lZDy/9VDp/lejbpRNV1DMGc67o0+nuVNyPXZR8k95QYaRfa\ntpq4SAe/uguldWT+w+2A2+qJ+RV1QRveT8yF36MAJQKBgQDYCaKc1cMHc7wV23nO\nHk2nmeZxRs/4wDmYA321WAnqJyP4NVSlcjVDs5oJz9RoAIwpxh/w0tXjEZ79J+ye\nVVsAk8cH1VPzCJNRTdiLPGTXDyOqp3t6cK40snQQGgB2qjqgWUBzmtrwrv+tTki9\na45Ws+Ht0lZFbuPpxXfLYE9KwwKBgQC2nfByaHdLt4ITdKC/RSRTh1iE18qU4gzp\nOvTA32J0NvOe/tWzJSjVqPDCbhK4Rr0OYoqNcRveaQzMQ7u0TTRz6THhFAjIMmFw\n2N8hs2w06VZVhPCFeKerk2sUs2obgki+QWjg5FabCdM4GsXGan4QzrcH3kudeiUW\nl5CnXgJUDQKBgDoTjQWAaaeNM1jk4X/JobKWqt503N/QPStidN7VRgUOdJr7K0A2\nzZ7fn19X4Y/75bItMtT4uMsMJ6OCoheGdqpXD8BJVwIUohXPSZFUsP8ncL0lvQoT\nVKGR/6V8d/dul8gXdj4duRHO2ajrTJ6vVVp1jRzz2IFd6CMmFKg1wdslAoGAaFm9\n0RJiwNB+srFdPY674EMh0N8iMostR4TZ4PCE6NWRxpPl9zVPrS+ZS/DsH4LEe1jR\nxVsRyriKiJpXwwKu62EgkHYLQqKPTZWPg0lslpuTKtEJQ6ubXA6kDLMs+cUr3hOw\nY3n3BybJHHEn/GZT3TTSH9vlp3npgYxgK1Mrz20CgYEA03ZcPoxr7nJhZrlTBGNO\n3Jci8a+IOuUgCKkfcwCuo6tH5KroyjOVh+b05hcwCUcRGfKLjxNnXcvNoEEqoBV4\nadAaCY/qppKypkaV62KHoNbhWkc5Bg1aWQB0k6l1r86MD7/RN29tY81STk0BUrRK\nrYB/0A9+ywhG3GEoy1v/Ok8=\n-----END PRIVATE KEY-----\n",
+  "client_email": "speech-service-account@stone-bongo-472205-g5.iam.gserviceaccount.com",
+  "client_id": "112093072726827791687",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/speech-service-account%40stone-bongo-472205-g5.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
