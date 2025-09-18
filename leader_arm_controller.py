@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Unified XL330-M077-T Leader Arm Controller
+Unified Leader Arm Controller
+Handles 4x XL330-M077-T motors
 Complete terminal interface for position reading, torque control, and real-time monitoring
 """
 
@@ -17,7 +18,7 @@ def load_hardware_config():
     """Load hardware configuration from hardware_config.json"""
     config_file = 'hardware_config.json'
     default_config = {
-        'port': '/dev/ttyACM0',
+        'port': '/dev/leader_arm',
         'baudrate': 1000000
     }
     
@@ -39,23 +40,58 @@ def load_hardware_config():
 # Load configuration
 hw_config = load_hardware_config()
 
-# XL330-M077-T Configuration
+# Dynamixel Configuration
 PROTOCOL_VERSION = 2.0
 BAUDRATE = hw_config['baudrate']
 DEVICE_NAME = hw_config['port']
 
-# Control Table Addresses
+# Motor Configuration - All XL330-M288-T
+MOTOR_CONFIGS = {
+    # All XL330-M288-T motors (IDs 1, 2, 3, 4)
+    1: {
+        'model': 'XL330-M288-T',
+        'model_number': 1190,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088  # degrees per unit
+    },
+    2: {
+        'model': 'XL330-M288-T',
+        'model_number': 1190,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088
+    },
+    3: {
+        'model': 'XL330-M288-T',
+        'model_number': 1190,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088
+    },
+    4: {
+        'model': 'XL330-M288-T',
+        'model_number': 1190,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088
+    }
+}
+
+# Control Table Addresses (Protocol 2.0)
 ADDR_TORQUE_ENABLE = 64
 ADDR_GOAL_POSITION = 116
 ADDR_PRESENT_POSITION = 132
 ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_CURRENT = 126
+ADDR_PRESENT_TEMPERATURE = 146
 
-# Motor Configuration
+# Motor IDs
 MOTOR_IDS = [1, 2, 3, 4]
-POSITION_CENTER = 2048
-POSITION_MIN = 0
-POSITION_MAX = 4095
 
 # Global variables
 port_handler = None
@@ -102,61 +138,69 @@ def initialize_dynamixel():
     return True
 
 def ping_motors():
-    """Ping all motors and return connected ones"""
+    """Ping all motors and return connected ones with type detection"""
     global connected_motors
-    
-    print_colored(f"\n📡 Scanning for motors {MOTOR_IDS}...", Colors.CYAN)
-    
+
+    print_colored(f"\n📡 Scanning for leader arm motors {MOTOR_IDS}...", Colors.CYAN)
+
     connected_motors = []
     for motor_id in MOTOR_IDS:
         model_number, comm_result, error = packet_handler.ping(port_handler, motor_id)
         if comm_result == COMM_SUCCESS:
-            print_colored(f"✓ Motor {motor_id}: Connected (Model: {model_number})", Colors.GREEN)
-            connected_motors.append(motor_id)
+            expected_config = MOTOR_CONFIGS[motor_id]
+
+            if model_number == expected_config['model_number']:
+                print_colored(f"✓ Motor {motor_id}: {expected_config['model']} connected (Model: {model_number})", Colors.GREEN)
+                connected_motors.append(motor_id)
+            else:
+                print_colored(f"⚠️  Motor {motor_id}: Wrong model (Expected: {expected_config['model_number']}, Got: {model_number})", Colors.WARNING)
         else:
-            print_colored(f"✗ Motor {motor_id}: Not found", Colors.WARNING)
-    
+            expected_config = MOTOR_CONFIGS[motor_id]
+            print_colored(f"✗ Motor {motor_id}: {expected_config['model']} not found", Colors.WARNING)
+
     if connected_motors:
         print_colored(f"✅ Found {len(connected_motors)} motors: {connected_motors}", Colors.GREEN)
     else:
         print_colored("❌ No motors found!", Colors.FAIL)
-    
+
     return len(connected_motors) > 0
 
 def read_motor_status(motor_ids=None, show_header=True):
     """Read comprehensive status of specified motors"""
     if motor_ids is None:
         motor_ids = connected_motors
-    
+
     if show_header:
-        print_colored("\n📋 Motor Status:", Colors.HEADER)
-        print_colored("-" * 100, Colors.HEADER)
-    
+        print_colored("\n📋 Leader Arm Motor Status:", Colors.HEADER)
+        print_colored("-" * 110, Colors.HEADER)
+
     status_data = {}
-    
+
     for motor_id in motor_ids:
+        config = MOTOR_CONFIGS[motor_id]
+
         # Torque state
         torque_enable, comm_result, error = packet_handler.read1ByteTxRx(
             port_handler, motor_id, ADDR_TORQUE_ENABLE)
         torque_enabled = (comm_result == COMM_SUCCESS and error == 0 and torque_enable)
         torque_str = f"{Colors.GREEN}ENABLED {Colors.ENDC}" if torque_enabled else f"{Colors.WARNING}DISABLED{Colors.ENDC}"
-        
+
         # Present Position
         position, comm_result, error = packet_handler.read4ByteTxRx(
             port_handler, motor_id, ADDR_PRESENT_POSITION)
         if comm_result == COMM_SUCCESS and error == 0:
-            angle = (position - POSITION_CENTER) * 0.088
+            angle = (position - config['position_center']) * config['angle_resolution']
             pos_str = f"{position:4d} ({angle:+6.2f}°)"
         else:
             pos_str = "---- (  ----°)"
-        
+
         # Goal Position
         goal_position, comm_result, error = packet_handler.read4ByteTxRx(
             port_handler, motor_id, ADDR_GOAL_POSITION)
         if comm_result == COMM_SUCCESS and error == 0:
-            goal_angle = (goal_position - POSITION_CENTER) * 0.088
+            goal_angle = (goal_position - config['position_center']) * config['angle_resolution']
             goal_str = f"{goal_position:4d} ({goal_angle:+6.2f}°)"
-            
+
             # Check if motor reached goal
             if position != -1:  # valid present position
                 diff = abs(position - goal_position)
@@ -169,28 +213,34 @@ def read_motor_status(motor_ids=None, show_header=True):
         else:
             goal_str = "---- (  ----°)"
             status_icon = "?"
-        
+
         # Velocity
         velocity, comm_result, error = packet_handler.read4ByteTxRx(
             port_handler, motor_id, ADDR_PRESENT_VELOCITY)
         if comm_result == COMM_SUCCESS and error == 0:
+            # XL330-M077-T velocity conversion
             rpm = velocity * 0.229 if velocity < 2147483648 else (velocity - 4294967296) * 0.229
             vel_str = f"{rpm:+6.1f} RPM"
         else:
             vel_str = "  ---- RPM"
-        
+
         # Current
         current, comm_result, error = packet_handler.read2ByteTxRx(
             port_handler, motor_id, ADDR_PRESENT_CURRENT)
         if comm_result == COMM_SUCCESS and error == 0:
+            # XL330-M077-T current conversion
             current_ma = current * 2.69 if current < 32768 else (current - 65536) * 2.69
             current_str = f"{current_ma:+6.1f} mA"
         else:
             current_str = "  ---- mA"
-        
-        print(f"  Motor {motor_id}: Torque {torque_str} | Present {pos_str} | Goal {goal_str} {status_icon} | Vel {vel_str} | Current {current_str}")
-        
+
+        # Motor type indicator
+        type_str = f"{Colors.BLUE}{config['model'][:5]}{Colors.ENDC}"
+
+        print(f"  Motor {motor_id} ({type_str}): Torque {torque_str} | Present {pos_str} | Goal {goal_str} {status_icon} | Vel {vel_str} | Current {current_str}")
+
         status_data[motor_id] = {
+            'model': config['model'],
             'torque_enabled': torque_enabled,
             'position': position if comm_result == COMM_SUCCESS and error == 0 else None,
             'goal_position': goal_position if comm_result == COMM_SUCCESS and error == 0 else None,
@@ -198,19 +248,20 @@ def read_motor_status(motor_ids=None, show_header=True):
             'velocity': velocity if comm_result == COMM_SUCCESS and error == 0 else None,
             'current': current if comm_result == COMM_SUCCESS and error == 0 else None
         }
-    
+
     return status_data
 
 def set_torque_state(motor_id, enable):
     """Set torque state for a specific motor"""
     action = "Enabling" if enable else "Disabling"
-    
+
     comm_result, error = packet_handler.write1ByteTxRx(
         port_handler, motor_id, ADDR_TORQUE_ENABLE, 1 if enable else 0)
-    
+
     if comm_result == COMM_SUCCESS and error == 0:
         status = f"{Colors.GREEN}✓{Colors.ENDC}"
-        print(f"  Motor {motor_id}: {action} torque... {status}")
+        config = MOTOR_CONFIGS[motor_id]
+        print(f"  Motor {motor_id} ({config['model'][:5]}): {action} torque... {status}")
         return True
     else:
         status = f"{Colors.FAIL}✗ {packet_handler.getTxRxResult(comm_result)}{Colors.ENDC}"
@@ -220,55 +271,63 @@ def set_torque_state(motor_id, enable):
 def set_all_torque_states(enable):
     """Set torque state for all connected motors"""
     action = "Enabling" if enable else "Disabling"
-    print_colored(f"\n⚡ {action} torque for all motors...", Colors.CYAN)
-    
+    print_colored(f"\n⚡ {action} torque for all leader arm motors...", Colors.CYAN)
+
     success_count = 0
     for motor_id in connected_motors:
         if set_torque_state(motor_id, enable):
             success_count += 1
-    
+
     if success_count == len(connected_motors):
         print_colored(f"✅ All {success_count} motors torque {'enabled' if enable else 'disabled'}", Colors.GREEN)
     else:
         print_colored(f"⚠️  {success_count}/{len(connected_motors)} motors torque {'enabled' if enable else 'disabled'}", Colors.WARNING)
-    
+
     return success_count == len(connected_motors)
 
-def validate_position(position):
-    """Validate if position is within safe range"""
+def validate_position(motor_id, position):
+    """Validate if position is within safe range for specific motor"""
+    if motor_id not in MOTOR_CONFIGS:
+        return False, f"Unknown motor ID {motor_id}"
+
     if not isinstance(position, (int, float)):
         return False, "Position must be a number"
-    
+
+    config = MOTOR_CONFIGS[motor_id]
     position = int(position)
-    if position < POSITION_MIN or position > POSITION_MAX:
-        return False, f"Position must be between {POSITION_MIN} and {POSITION_MAX}"
-    
+
+    if position < config['position_min'] or position > config['position_max']:
+        return False, f"Position must be between {config['position_min']} and {config['position_max']} for {config['model']}"
+
     return True, position
 
-def angle_to_position(angle):
-    """Convert angle in degrees to motor position"""
-    return int(POSITION_CENTER + (angle / 0.088))
+def angle_to_position(motor_id, angle):
+    """Convert angle in degrees to motor position for specific motor"""
+    config = MOTOR_CONFIGS[motor_id]
+    return int(config['position_center'] + (angle / config['angle_resolution']))
 
-def position_to_angle(position):
-    """Convert motor position to angle in degrees"""
-    return (position - POSITION_CENTER) * 0.088
+def position_to_angle(motor_id, position):
+    """Convert motor position to angle in degrees for specific motor"""
+    config = MOTOR_CONFIGS[motor_id]
+    return (position - config['position_center']) * config['angle_resolution']
 
 def set_goal_position(motor_id, position):
     """Set goal position for a specific motor"""
     # Validate position
-    valid, result = validate_position(position)
+    valid, result = validate_position(motor_id, position)
     if not valid:
         print_colored(f"❌ Invalid position: {result}", Colors.FAIL)
         return False
-    
+
     position = result
-    angle = position_to_angle(position)
-    
-    print(f"  Motor {motor_id}: Setting goal position {position} ({angle:+6.2f}°)...", end=" ")
-    
+    angle = position_to_angle(motor_id, position)
+    config = MOTOR_CONFIGS[motor_id]
+
+    print(f"  Motor {motor_id} ({config['model'][:5]}): Setting goal position {position} ({angle:+6.2f}°)...", end=" ")
+
     comm_result, error = packet_handler.write4ByteTxRx(
         port_handler, motor_id, ADDR_GOAL_POSITION, position)
-    
+
     if comm_result == COMM_SUCCESS and error == 0:
         print_colored("✓", Colors.GREEN)
         return True
@@ -278,31 +337,33 @@ def set_goal_position(motor_id, position):
 
 def move_motor_to_angle(motor_id, angle):
     """Move motor to specific angle in degrees"""
-    position = angle_to_position(angle)
-    
+    position = angle_to_position(motor_id, angle)
+
     # Validate converted position
-    valid, validated_pos = validate_position(position)
+    valid, validated_pos = validate_position(motor_id, position)
     if not valid:
         print_colored(f"❌ Angle {angle}° converts to invalid position: {validated_pos}", Colors.FAIL)
         return False
-    
-    print_colored(f"\n🎯 Moving Motor {motor_id} to {angle:+6.2f}° (position {validated_pos})...", Colors.CYAN)
+
+    config = MOTOR_CONFIGS[motor_id]
+    print_colored(f"\n🎯 Moving Motor {motor_id} ({config['model']}) to {angle:+6.2f}° (position {validated_pos})...", Colors.CYAN)
     return set_goal_position(motor_id, validated_pos)
 
 def move_to_center_position():
     """Move all motors to center position (0 degrees)"""
-    print_colored(f"\n🎯 Moving all motors to center position (0°)...", Colors.CYAN)
-    
+    print_colored(f"\n🎯 Moving all leader arm motors to center position (0°)...", Colors.CYAN)
+
     success_count = 0
     for motor_id in connected_motors:
-        if set_goal_position(motor_id, POSITION_CENTER):
+        config = MOTOR_CONFIGS[motor_id]
+        if set_goal_position(motor_id, config['position_center']):
             success_count += 1
-    
+
     if success_count == len(connected_motors):
         print_colored(f"✅ All {success_count} motors moved to center", Colors.GREEN)
     else:
         print_colored(f"⚠️  {success_count}/{len(connected_motors)} motors moved successfully", Colors.WARNING)
-    
+
     return success_count == len(connected_motors)
 
 def wait_for_movement_complete(motor_ids=None, timeout=10, threshold=10):
@@ -345,51 +406,55 @@ def wait_for_movement_complete(motor_ids=None, timeout=10, threshold=10):
 def real_time_monitor():
     """Real-time position monitoring in background thread"""
     global monitoring_active
-    
+
     last_positions = {}
     update_count = 0
-    
+
     print_colored("🔄 Real-time monitoring started (Press 'm' to stop)", Colors.CYAN)
-    print_colored("📍 Move the arm to see position changes", Colors.CYAN)
-    print_colored("-" * 80, Colors.HEADER)
-    
+    print_colored("📍 Move the leader arm to see position changes", Colors.CYAN)
+    print_colored("-" * 90, Colors.HEADER)
+
     while monitoring_active:
         current_positions = {}
         position_changed = False
-        
+
         # Read all motor positions
         for motor_id in connected_motors:
             position, comm_result, error = packet_handler.read4ByteTxRx(
                 port_handler, motor_id, ADDR_PRESENT_POSITION)
-            
+
             if comm_result == COMM_SUCCESS and error == 0:
-                angle = (position - POSITION_CENTER) * 0.088
+                config = MOTOR_CONFIGS[motor_id]
+                angle = (position - config['position_center']) * config['angle_resolution']
                 current_positions[motor_id] = {
                     'raw': position,
                     'angle': angle
                 }
-                
+
                 # Check if position changed significantly (>3 units)
-                if (motor_id not in last_positions or 
+                if (motor_id not in last_positions or
                     abs(position - last_positions[motor_id]['raw']) > 3):
                     position_changed = True
-        
+
         # Only print if positions changed or every 20 updates
         if position_changed or update_count % 20 == 0:
             timestamp = time.strftime('%H:%M:%S')
             print(f"\r{Colors.BLUE}⏰ {timestamp}{Colors.ENDC} | ", end="")
-            
+
             for motor_id in connected_motors:
+                config = MOTOR_CONFIGS[motor_id]
+                type_abbr = "288" if "M288" in config['model'] else "330"
+
                 if motor_id in current_positions:
                     pos_data = current_positions[motor_id]
-                    print(f"M{motor_id}: {pos_data['raw']:4d} ({pos_data['angle']:+6.2f}°) | ", end="")
+                    print(f"M{motor_id}({type_abbr}): {pos_data['raw']:4d} ({pos_data['angle']:+6.2f}°) | ", end="")
                 else:
-                    print(f"M{motor_id}: ---- (  ----°) | ", end="")
+                    print(f"M{motor_id}({type_abbr}): ---- (  ----°) | ", end="")
             print("")
-        
+
         last_positions = current_positions.copy()
         update_count += 1
-        
+
         time.sleep(0.05)  # 20Hz update rate
 
 def start_monitoring():
@@ -443,11 +508,10 @@ def show_help():
     print("  'c' or 'clear'      - Clear screen")
     print("  'q' or 'quit'       - Quit controller")
     print_colored("=" * 70, Colors.HEADER)
-    print_colored("💡 Tips:", Colors.WARNING)
+    print_colored("💡 Motor Types:", Colors.WARNING)
+    print("  - All motors 1-4: XL330-M288-T")
+    print("  - All motors: Center=2048 (0°), Range=0-4095 (≈±180°)")
     print("  - Motors must have torque enabled to move")
-    print("  - Center position is 2048 (0 degrees)")
-    print("  - Position range: 0-4095 (≈ ±180°)")
-    print("  - Use 'status' to see current vs goal positions")
 
 def clear_screen():
     """Clear terminal screen"""
@@ -468,12 +532,13 @@ def main():
     
     # Header
     clear_screen()
-    print_colored("🦾 XL330-M077-T Leader Arm Controller", Colors.HEADER + Colors.BOLD)
-    print_colored("=" * 60, Colors.HEADER)
+    print_colored("🦾 Leader Arm Controller (All XL330-M288-T)", Colors.HEADER + Colors.BOLD)
+    print_colored("=" * 70, Colors.HEADER)
     print(f"Device: {DEVICE_NAME}")
     print(f"Baudrate: {BAUDRATE}")
     print(f"Expected Motors: {MOTOR_IDS}")
-    print_colored("=" * 60, Colors.HEADER)
+    print(f"Motor Types: All XL330-M288-T (1,2,3,4)")
+    print_colored("=" * 70, Colors.HEADER)
     
     # Initialize
     if not initialize_dynamixel():
@@ -506,7 +571,7 @@ def main():
                 
             elif cmd in ['c', 'clear']:
                 clear_screen()
-                print_colored("🦾 Leader Arm Controller", Colors.HEADER + Colors.BOLD)
+                print_colored("🦾 Leader Arm Controller (All XL330-M288-T)", Colors.HEADER + Colors.BOLD)
                 
             elif cmd in ['s', 'status']:
                 read_motor_status()
@@ -615,8 +680,9 @@ def main():
                                 port_handler, motor_id, ADDR_TORQUE_ENABLE)
                             
                             if comm_result == COMM_SUCCESS and error == 0 and torque_enable:
-                                angle = position_to_angle(position)
-                                print_colored(f"\n🎯 Moving Motor {motor_id} to position {position} ({angle:+6.2f}°)...", Colors.CYAN)
+                                angle = position_to_angle(motor_id, position)
+                                config = MOTOR_CONFIGS[motor_id]
+                                print_colored(f"\n🎯 Moving Motor {motor_id} ({config['model']}) to position {position} ({angle:+6.2f}°)...", Colors.CYAN)
                                 set_goal_position(motor_id, position)
                                 if not monitoring_active:
                                     time.sleep(1)

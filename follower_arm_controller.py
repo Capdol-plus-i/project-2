@@ -18,7 +18,7 @@ def load_hardware_config():
     """Load hardware configuration from hardware_config.json"""
     config_file = 'hardware_config.json'
     default_config = {
-        'port': '/dev/ttyACM1',
+        'port': '/dev/follower_arm',
         'baudrate': 1000000
     }
     
