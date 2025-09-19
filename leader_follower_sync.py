@@ -18,7 +18,7 @@ def load_hardware_config():
     config_file = 'hardware_config.json'
     default_config = {
         'leader': {'port': '/dev/leader_arm', 'baudrate': 1000000},
-        'follower': {'port': '/dev/ttyACM2', 'baudrate': 1000000}
+        'follower': {'port': '/dev/follower_arm', 'baudrate': 1000000}
     }
     
     if os.path.exists(config_file):
