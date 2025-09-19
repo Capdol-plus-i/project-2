@@ -21,7 +21,16 @@
       "Bash(git push:*)",
       "Bash(source:*)",
       "Bash(pio:*)",
-      "Read(//home/capdol/**)"
+      "Read(//home/capdol/**)",
+      "Bash(awk:*)",
+      "Bash(xargs -r kill -9)",
+      "Bash(/bashes)",
+      "Bash(DEV=/dev/video0 python hand_landmark_demo.py)",
+      "Bash(netstat:*)",
+      "Bash(kill:*)",
+      "Bash(timeout 10s python3:*)",
+      "Bash(timeout:*)",
+      "Bash(git rm:*)"
     ],
     "deny": [],
     "ask": []
