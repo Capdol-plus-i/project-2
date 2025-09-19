@@ -27,11 +27,12 @@
 6. [카메라 프리셋(밝기/노출 등) 자동 적용](#카메라-프리셋밝기노출-등-자동-적용)
 7. [GStreamer 송출 & Windows 수신/합성](#gstreamer-송출--windows-수신합성)
 8. [MediaPipe 손 검출 + 오버레이 + 송출(gi/GStreamer)](#mediapipe-손-검출--오버레이--송출gigstreamer)
-9. [손 좌표 → Dynamixel 로봇팔 추종 노드](#손-좌표--dynamixel-로봇팔-추종-노드)
-10. [Arduino/NeoPixel 제어(PlatformIO)](#arduinoneopixel-제어platformio)
-11. [음성 인식(웨이크워드+명령)](#음성-인식웨이크워드명령)
-12. [부팅/실행 자동화(선택)](#부팅실행-자동화선택)
-13. [자주 쓰는 확인/디버깅 명령](#자주-쓰는-확인디버깅-명령)
+9. [통합 로거: 손 추적 + 로봇팔 동기화 + 데이터 수집](#통합-로거-손-추적--로봇팔-동기화--데이터-수집)
+10. [Leader-Follower 로봇팔 동기화](#leader-follower-로봇팔-동기화)
+11. [Arduino/NeoPixel 제어(PlatformIO)](#arduinoneopixel-제어platformio)
+12. [음성 인식(웨이크워드+명령)](#음성-인식웨이크워드명령)
+13. [부팅/실행 자동화(선택)](#부팅실행-자동화선택)
+14. [자주 쓰는 확인/디버깅 명령](#자주-쓰는-확인디버깅-명령)
 
 ---
 
@@ -75,6 +76,7 @@ source .venv_cv/bin/activate
 pip install --upgrade pip wheel setuptools
 pip install "mediapipe==0.10.18" "protobuf<5,>=4.25.3" numpy==1.26.4 scipy==1.15.3
 pip install pyaudio webrtcvad sounddevice dynamixel-sdk google-cloud-speech
+pip install PyGObject pycairo  # GStreamer Python bindings
 ```
 
 > 확인:
@@ -86,10 +88,31 @@ pip install pyaudio webrtcvad sounddevice dynamixel-sdk google-cloud-speech
 > import webrtcvad; print("webrtcvad OK")
 > from dynamixel_sdk import *; print("Dynamixel SDK OK")
 > from google.cloud import speech; print("Google Cloud Speech OK")
+> import gi; gi.require_version('Gst', '1.0'); print("GStreamer Python bindings OK")
 > PY
 > ```
 >
 > 모두 OK면 통합 환경 완료.
+
+### 프로젝트 구조
+
+```
+~/project-2/
+├── unified_logger.py              # 통합 로거 (손 추적 + 로봇팔 + 데이터 수집)
+├── leader_follower_sync.py        # Leader-Follower 로봇팔 동기화
+├── voice_recognition_improved.py  # 향상된 음성 인식 시스템
+├── hardware_config.json          # 하드웨어 설정
+├── calibration.json              # 로봇팔 calibration 데이터
+├── scripts/
+│   ├── hand_overlay_stream.py    # 손 오버레이 스트리밍 (OpenCV)
+│   ├── hand_overlay_stream_gst.py # 손 오버레이 스트리밍 (GStreamer)
+│   ├── apply_cam_preset.sh       # 카메라 프리셋 적용
+│   └── set_led.py               # LED 제어 스크립트
+├── firmware/                     # Arduino 펌웨어
+│   ├── platformio.ini
+│   └── src/main.cpp
+└── .venv_cv/                    # Python 가상환경
+```
 
 ---
 
@@ -292,13 +315,14 @@ sudo udevadm trigger --subsystem-match=video4linux
 
 ## GStreamer 송출 & Windows 수신/합성
 
-### Jetson → H.264 RTP
+### 기본 카메라 스트리밍
 
-(예: **왼쪽** 카메라 1280×720\@30, 포트 **5001**, PT=96)
+#### Jetson → H.264 RTP (기본)
 
 ```zsh
 export RX=<WINDOWS_IP>
 
+# 왼쪽 카메라 (포트 5001, PT=96)
 gst-launch-1.0 -e \
   v4l2src device=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 io-mode=2 ! \
   image/jpeg,width=1280,height=720,framerate=30/1 ! \
@@ -306,81 +330,442 @@ gst-launch-1.0 -e \
   x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=30 ! \
   h264parse config-interval=1 ! rtph264pay pt=96 mtu=1200 ! \
   udpsink host=$RX port=5001 sync=false async=false
+
+# 오른쪽 카메라 (포트 5003, PT=97)
+gst-launch-1.0 -e \
+  v4l2src device=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0 io-mode=2 ! \
+  image/jpeg,width=1280,height=720,framerate=30/1 ! \
+  jpegdec ! videoconvert ! queue leaky=downstream max-size-buffers=1 ! \
+  x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=30 ! \
+  h264parse config-interval=1 ! rtph264pay pt=97 mtu=1200 ! \
+  udpsink host=$RX port=5003 sync=false async=false
 ```
 
-**오른쪽** 카메라(포트 **5003**, PT=97)도 동일하게.
+### 고급 스트리밍 (스크립트 기반)
 
-### Windows 수신(각각)
+#### 1) OpenCV 기반 손 오버레이 스트리밍
 
-```powershell
-# 왼쪽(5001, pt=96)
-gst-launch-1.0 -v `
-  udpsrc port=5001 caps="application/x-rtp, media=video, encoding-name=H264, payload=96, clock-rate=90000" ! `
-  rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! d3d11h264dec ! d3d11videosink sync=false
-```
-
-### Windows 두 화면 합성(2×1)
-
-```powershell
-gst-launch-1.0 -v `
-  compositor name=mix background=black `
-    sink_0::xpos=0   sink_0::ypos=0   sink_0::width=960  sink_0::height=540 ! `
-  videoconvert ! autovideosink sync=false `
-  udpsrc port=5001 caps="application/x-rtp, media=video, encoding-name=H264, payload=96,  clock-rate=90000" ! `
-    rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! avdec_h264 ! queue ! videoconvert ! mix.sink_0 `
-  udpsrc port=5003 caps="application/x-rtp, media=video, encoding-name=H264, payload=97,  clock-rate=90000" ! `
-    rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! avdec_h264 ! queue ! videoconvert ! mix.sink_1
-```
-
-> 하드웨어 디코딩 가능하면 `avdec_h264` 대신 `d3d11h264dec` 사용.
-
----
-
-## MediaPipe 손 검출 + 오버레이 + 송출(gi/GStreamer)
-
-OpenCV `VideoWriter(CAP_GSTREAMER)` 이슈를 우회하여 **gi(GObject)로 GStreamer 파이프라인 직접 구성**.
-
-`scripts/hand_overlay_stream_gst.py`
-
-```python
-#!/usr/bin/env python3
-import os; os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-import gi; gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GObject
-import sys, time, argparse, json, socket
-import cv2, numpy as np
-
-Gst.init(None)
-
-# (인자 파서 생략) — 본문은 대화 내용의 최신 버전 사용
-# 핵심 아이디어:
-# - 입력: OpenCV VideoCapture (GStreamer → 실패 시 V4L2)
-# - MediaPipe로 손 랜드마크 오버레이
-# - 출력: gi 기반 GStreamer 파이프라인(appsrc→x264enc→rtph264pay→udpsink)
-# - 옵션: --send-xy HOST:PORT 로 손 좌표(JSON) UDP 송신
-
-# 전체 스크립트는 대화에서 제공한 최신본 사용
-```
-
-실행 예:
+`scripts/hand_overlay_stream.py` - MediaPipe 손 추적과 GStreamer 통합:
 
 ```zsh
 source ~/project-2/.venv_cv/bin/activate
 
-# 왼쪽 카메라 → 5001, 좌표를 로컬 UDP(5555)로 발행
-python scripts/hand_overlay_stream_gst.py \
+# 왼쪽 카메라 → 5001, 손 좌표를 UDP(5555)로 발행
+python scripts/hand_overlay_stream.py \
   --rx 10.96.162.204 --port 5001 --pt 96 \
   --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 \
   --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30 \
   --send-xy 127.0.0.1:5555 --preview
 
 # 오른쪽 카메라 → 5003
-python scripts/hand_overlay_stream_gst.py \
+python scripts/hand_overlay_stream.py \
   --rx 10.96.162.204 --port 5003 --pt 97 \
   --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0 \
   --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30
 ```
 
+#### 2) GStreamer Python 기반 스트리밍
+
+`scripts/hand_overlay_stream_gst.py` - gi/GObject로 파이프라인 직접 구성:
+
+```zsh
+# 왼쪽 카메라 (더 안정적인 GStreamer 파이프라인)
+python scripts/hand_overlay_stream_gst.py \
+  --rx 10.96.162.204 --port 5001 --pt 96 \
+  --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 \
+  --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30 \
+  --send-xy 127.0.0.1:5555
+```
+
+> **권장**: OpenCV VideoWriter 이슈가 있을 때 `hand_overlay_stream_gst.py` 사용
+
+### Windows 수신
+
+#### 단일 카메라 수신
+
+```powershell
+# 왼쪽(5001, pt=96)
+gst-launch-1.0 -v `
+  udpsrc port=5001 caps="application/x-rtp, media=video, encoding-name=H264, payload=96, clock-rate=90000" ! `
+  rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! d3d11h264dec ! d3d11videosink sync=false
+
+# 오른쪽(5003, pt=97)
+gst-launch-1.0 -v `
+  udpsrc port=5003 caps="application/x-rtp, media=video, encoding-name=H264, payload=97, clock-rate=90000" ! `
+  rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! d3d11h264dec ! d3d11videosink sync=false
+```
+
+#### 듀얼 카메라 합성 (2×1)
+
+```powershell
+gst-launch-1.0 -v `
+  compositor name=mix background=black `
+    sink_0::xpos=0   sink_0::ypos=0   sink_0::width=960  sink_0::height=540 `
+    sink_1::xpos=960 sink_1::ypos=0   sink_1::width=960  sink_1::height=540 ! `
+  videoconvert ! autovideosink sync=false `
+  udpsrc port=5001 caps="application/x-rtp, media=video, encoding-name=H264, payload=96, clock-rate=90000" ! `
+    rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! avdec_h264 ! queue ! videoconvert ! mix.sink_0 `
+  udpsrc port=5003 caps="application/x-rtp, media=video, encoding-name=H264, payload=97, clock-rate=90000" ! `
+    rtpjitterbuffer latency=60 ! rtph264depay ! h264parse ! avdec_h264 ! queue ! videoconvert ! mix.sink_1
+```
+
+> 하드웨어 디코딩 가능하면 `avdec_h264` 대신 `d3d11h264dec` 사용
+
+---
+
+## MediaPipe 손 검출 + 오버레이 + 송출
+
+현재 프로젝트에는 두 가지 MediaPipe 손 검출 방식이 구현되어 있습니다:
+
+### 1) 통합 로거 방식 (권장)
+
+`unified_logger.py`는 모든 기능을 통합한 솔루션으로, 실시간 카메라 디스플레이와 데이터 수집을 제공합니다:
+
+```zsh
+source ~/project-2/.venv_cv/bin/activate
+
+# 실시간 카메라 화면 + 손 추적 + 데이터 수집
+python unified_logger.py --test  # 테스트 모드 (기록 안함)
+python unified_logger.py --mode snapshot  # 스냅샷 모드
+python unified_logger.py --mode continuous  # 연속 기록 모드
+
+# 로봇팔 동기화 포함
+python unified_logger.py --test --sync --cal-load calibration.json
+```
+
+**주요 특징:**
+- **듀얼 카메라 지원**: 양손 동시 추적
+- **실시간 오버레이**: 검지손가락 좌표와 랜드마크 표시
+- **데이터 수집**: CSV 형태로 모든 데이터 저장
+- **로봇팔 연동**: Leader-Follower 동기화 동시 실행
+
+### 2) 스트리밍 전용 방식
+
+네트워크 스트리밍이 필요한 경우 전용 스크립트 사용:
+
+#### OpenCV 기반 스트리밍
+
+`scripts/hand_overlay_stream.py` - OpenCV VideoWriter 사용:
+
+```zsh
+# 왼쪽 카메라 → Windows(5001 포트), 손 좌표를 UDP(5555)로 발행
+python scripts/hand_overlay_stream.py \
+  --rx 10.96.162.204 --port 5001 --pt 96 \
+  --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 \
+  --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30 \
+  --send-xy 127.0.0.1:5555 --preview
+
+# 오른쪽 카메라 → Windows(5003 포트)
+python scripts/hand_overlay_stream.py \
+  --rx 10.96.162.204 --port 5003 --pt 97 \
+  --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0 \
+  --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30
+```
+
+#### GStreamer Python 기반 스트리밍
+
+`scripts/hand_overlay_stream_gst.py` - gi/GObject로 파이프라인 직접 구성:
+
+```zsh
+# OpenCV VideoWriter 이슈 우회 (더 안정적)
+python scripts/hand_overlay_stream_gst.py \
+  --rx 10.96.162.204 --port 5001 --pt 96 \
+  --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 \
+  --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30 \
+  --send-xy 127.0.0.1:5555
+```
+
+### MediaPipe 설정 최적화
+
+**성능 조정:**
+```python
+# 높은 정확도 (높은 CPU 사용률)
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    model_complexity=1,  # 0-2 (높을수록 정확하지만 느림)
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
+
+# 성능 우선 (낮은 CPU 사용률)
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=0,  # 가장 빠름
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.3
+)
+```
+
+**해상도 조정:**
+```zsh
+# 고해상도 (높은 품질, 높은 CPU)
+export W=1280 H=720 FPS=30
+
+# 최적화 (균형)
+export W=960 H=540 FPS=24
+
+# 성능 우선 (낮은 품질, 낮은 CPU)
+export W=640 H=480 FPS=20
+```
+
+### 손 좌표 데이터 형식
+
+#### UDP JSON 형식 (스트리밍용)
+```json
+{
+  "timestamp": 1640995200.123,
+  "hands": [
+    {
+      "landmarks": [[0.1, 0.2, 0.05], ...],  # 21개 랜드마크
+      "index_tip": [120, 240],                # 검지 끝 픽셀 좌표
+      "handedness": "Right"
+    }
+  ]
+}
+```
+
+#### CSV 형식 (데이터 수집용)
+```csv
+timestamp,cam1_x,cam1_y,cam2_x,cam2_y,follower_pos1,follower_pos2,follower_pos3,follower_pos4
+1640995200.123,120,240,135,255,2048,2100,1950,2048
+```
+
+
+---
+
+## 통합 로거: 손 추적 + 로봇팔 동기화 + 데이터 수집
+
+`unified_logger.py`는 모든 기능을 통합한 올인원 솔루션입니다:
+
+### 주요 기능
+
+1. **듀얼 카메라 손 추적**: MediaPipe로 양손 검지손가락 좌표 추출
+2. **Leader-Follower 로봇팔 동기화**: 실시간 모터 위치 동기화
+3. **실시간 카메라 디스플레이**: 손가락 좌표와 랜드마크 오버레이
+4. **데이터 수집**: CSV 형태로 모든 데이터 통합 로깅
+5. **Calibration 시스템**: 로봇팔 간 정확한 매핑
+
+### 사용법
+
+#### 기본 명령어
+
+```zsh
+source ~/project-2/.venv_cv/bin/activate
+
+# 기본 연속 기록 (실시간 카메라 화면 포함)
+python unified_logger.py --mode continuous
+
+# 스냅샷 모드 (SPACE키로 수동 기록)
+python unified_logger.py --mode snapshot
+
+# 테스트 모드 (기록하지 않고 화면만)
+python unified_logger.py --test
+
+# 동기화 포함 모드
+python unified_logger.py --sync --cal-load calibration.json
+
+# 동기화 + 스냅샷 모드
+python unified_logger.py --mode snapshot --sync --cal-load calibration.json
+```
+
+#### 명령행 옵션
+
+- `--mode`: `continuous` (연속기록) 또는 `snapshot` (수동기록)
+- `--sync`: Leader-Follower 동기화 활성화
+- `--cal-load`: Calibration 파일 로드
+- `--test`: 테스트 모드 (기록하지 않음)
+- `--output`: 출력 CSV 파일명 지정
+
+#### 실시간 화면 기능
+
+- **검지손가락 끝**: 초록색 원과 좌표 텍스트로 표시
+- **손 랜드마크**: MediaPipe 손 구조 전체 표시
+- **상태 정보**: 화면 상단에 모드, 프레임 번호 등 표시
+- **제어 안내**: 화면 하단에 키 조작 안내
+
+#### 키 조작
+
+- **연속 기록 모드**: `Ctrl+C` 또는 `ESC`로 종료
+- **스냅샷 모드**: `SPACE`로 스냅샷, `ESC`로 종료
+- **테스트 모드**: `Ctrl+C` 또는 `ESC`로 종료
+
+#### 출력 데이터 형식
+
+CSV 파일에 다음 컬럼으로 저장:
+```
+timestamp, cam1_x, cam1_y, cam2_x, cam2_y, follower_pos1, follower_pos2, follower_pos3, follower_pos4
+```
+
+### 하드웨어 설정
+
+#### 카메라 설정
+- Camera 1: `/dev/video0` (첫 번째 USB 카메라)
+- Camera 2: `/dev/video2` (두 번째 USB 카메라, 선택사항)
+
+#### 로봇팔 설정
+- **Leader Arm**: `/dev/leader_arm` (XL330-M077-T x4)
+- **Follower Arm**: `/dev/follower_arm` (XL430-W250-T x3 + XL330-M288-T x1)
+
+설정은 `hardware_config.json`에서 수정 가능:
+
+```json
+{
+  "robot_arms": {
+    "leader": {"port": "/dev/leader_arm", "baudrate": 1000000},
+    "follower": {"port": "/dev/follower_arm", "baudrate": 1000000}
+  }
+}
+```
+
+### Calibration 시스템
+
+#### 자동 Calibration (권장)
+```zsh
+# leader_follower_sync.py 사용
+python leader_follower_sync.py
+# 프로그램 내에서: cal auto → cal save
+```
+
+#### 수동 Calibration
+```zsh
+# leader_follower_sync.py 사용
+python leader_follower_sync.py
+# 프로그램 내에서:
+# cal zero (양쪽 팔을 센터로)
+# cal 1 -5 (모터 1에 -5도 오프셋)
+# cal save
+```
+
+#### Calibration 데이터 구조
+```json
+{
+  "position_offsets": {"1": 0.0, "2": -5.2, "3": 3.1, "4": 0.0},
+  "direction_multipliers": {"1": 1, "2": -1, "3": 1, "4": 1},
+  "id_map": {"1": 1, "2": 2, "3": 3, "4": 4}
+}
+```
+
+### 환경 변수
+
+카메라 해상도/FPS 조정:
+```zsh
+export W=1280 H=720 FPS=30
+python unified_logger.py --test
+```
+
+### 문제 해결
+
+#### 카메라 문제
+```zsh
+# 카메라 장치 확인
+v4l2-ctl --list-devices
+
+# 카메라 포맷 확인
+v4l2-ctl -d /dev/video0 --list-formats-ext
+
+# 권한 확인
+ls -l /dev/video*
+```
+
+#### 로봇팔 연결 문제
+```zsh
+# 시리얼 포트 확인
+ls -l /dev/leader_arm /dev/follower_arm
+
+# udev 규칙 재로드
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+#### MediaPipe 성능 최적화
+- 해상도 낮추기: `W=640 H=480`
+- FPS 낮추기: `FPS=20`
+- 복잡도 낮추기: 코드에서 `model_complexity=0`
+
+---
+
+## Leader-Follower 로봇팔 동기화
+
+독립적인 Leader-Follower 동기화 시스템으로, 실시간 로봇팔 추종 제어를 제공합니다.
+
+### 사용법
+
+```zsh
+source ~/project-2/.venv_cv/bin/activate
+python leader_follower_sync.py
+```
+
+### 주요 명령어
+
+#### 동기화 제어
+- `start`: 실시간 동기화 시작
+- `stop`: 동기화 중지
+- `status`: 현재 상태 확인
+
+#### Calibration 명령어
+```
+cal auto        # 자동 calibration
+cal zero        # 양쪽 팔을 센터 위치로 이동
+cal 1 -5        # 모터 1에 -5도 오프셋 설정
+cal reset       # 모든 오프셋 초기화
+cal save        # Calibration 저장
+cal load        # Calibration 로드
+```
+
+#### 매핑 명령어
+```
+map 1 2         # Leader 모터 1을 Follower 모터 2에 매핑
+map reset       # 매핑을 기본(1:1)으로 초기화
+```
+
+#### 시스템 명령어
+- `h`, `help`: 도움말 표시
+- `c`, `clear`: 화면 지우기
+- `q`, `quit`: 프로그램 종료
+
+### 설정 파일
+
+#### hardware_config.json
+```json
+{
+  "robot_arms": {
+    "leader": {"port": "/dev/leader_arm", "baudrate": 1000000},
+    "follower": {"port": "/dev/follower_arm", "baudrate": 1000000}
+  }
+}
+```
+
+#### calibration.json (자동 생성)
+```json
+{
+  "timestamp": 1640995200.0,
+  "position_offsets": {"1": 0.0, "2": -5.2, "3": 3.1, "4": 0.0},
+  "direction_multipliers": {"1": 1, "2": -1, "3": 1, "4": 1},
+  "id_map": {"1": 1, "2": 2, "3": 3, "4": 4}
+}
+```
+
+### 모터 구성
+
+#### Leader Arm (XL330-M077-T x4)
+- 모터 ID: 1, 2, 3, 4
+- 중심값: 2048 (0도)
+- 해상도: 0.088도/unit
+
+#### Follower Arm (XL430-W250-T x3 + XL330-M288-T x1)
+- 모터 1-3: XL430-W250-T
+- 모터 4: XL330-M288-T
+- 중심값: 2048 (0도)
+- 해상도: 0.088도/unit
+
+### 안전 기능
+
+- **에러 처리**: 연속 에러 시 자동 동기화 중지
+- **토크 관리**: Follower 모터 토크 자동 on/off
+- **신호 처리**: Ctrl+C로 안전한 종료
+- **범위 제한**: 모터 위치 0-4095 범위 제한
 
 ---
 
@@ -415,6 +800,25 @@ pio pkg install --library "Adafruit NeoPixel"
 
 ## 음성 인식(웨이크워드+명령)
 
+### 향상된 음성 인식 시스템
+
+`voice_recognition_improved.py`는 개선된 음성 인식 시스템을 제공합니다:
+
+#### 주요 특징
+
+- **듀얼 모드**: 웨이크워드 대기 → 명령 인식
+- **로컬 VAD**: WebRTC VAD로 무음 구간 필터링
+- **컨텍스트 힌트**: 웨이크워드/명령어 힌트로 인식률 향상
+- **통합 제어**: NeoPixel LED + 로봇팔 토크 제어
+- **실시간 피드백**: 상태별 LED 색상 변경
+
+#### 사용법
+
+```zsh
+source ~/project-2/.venv_cv/bin/activate
+python voice_recognition_improved.py
+```
+
 ### Google Cloud Speech 인증 설정
 
 1. **Google Cloud Console에서 서비스 계정 키 생성:**
@@ -440,61 +844,529 @@ python -c "from google.cloud import speech; print('✓ 인증 성공')"
 3. **API 활성화 확인:**
    - Google Cloud Console에서 Speech-to-Text API 활성화 확인
 
-### 음성 처리 설정
+### 음성 명령어 체계
 
-* VAD: `webrtcvad==2.0.10`
-* 마이크 샘플레이트: **장치 기본(예: 44100Hz)**에 맞추어 코드 상수 변경
-* Google Cloud Speech:
-  * 모델: `"command_and_search"`, 언어: `"ko-KR"`
-  * speech context에 웨이크워드/명령 집합
-* 기본 로직:
-  1. VAD로 무음 제거하며 웨이크워드 스트리밍
-  2. 웨이크워드 감지 → 짧은 **명령** 스트리밍 → 매칭 → 제어(토크 on/off, LED 색 등)
+#### 웨이크워드
+- "헤이 로봇", "로봇아", "시작해"
+
+#### 제어 명령어
+
+**로봇팔 토크 제어:**
+- "토크 켜" / "토크 온" → 모든 모터 토크 활성화
+- "토크 꺼" / "토크 오프" → 모든 모터 토크 비활성화
+
+**LED 색상 제어:**
+- "빨간불" → 빨간색 (255, 0, 0)
+- "파란불" → 파란색 (0, 0, 255)
+- "초록불" → 초록색 (0, 255, 0)
+- "노란불" → 노란색 (255, 255, 0)
+- "하얀불" → 흰색 (255, 255, 255)
+- "불 꺼" → LED 끄기 (0, 0, 0)
+
+### 시스템 설정
+
+#### 마이크 설정
+```zsh
+# Blue Tiki USB 마이크 (44.1kHz 권장)
+# voice_recognition_improved.py에서 자동으로 샘플레이트 설정
+```
+
+#### 하드웨어 연결 확인
+```zsh
+# Arduino 연결 확인
+ls -l /dev/arduino
+
+# 로봇팔 연결 확인
+ls -l /dev/leader_arm /dev/follower_arm
+
+# 마이크 확인
+arecord -l
+```
+
+### 음성 처리 파라미터
+
+#### VAD 설정
+```python
+# voice_recognition_improved.py 내부 설정
+VAD_MODE = 3  # 0-3 (3이 가장 aggressive)
+SAMPLE_RATE = 44100  # Blue Tiki 마이크 기준
+CHUNK_DURATION_MS = 30  # VAD 청크 크기
+```
+
+#### Google Cloud Speech 설정
+```python
+# 언어 및 모델 설정
+config = speech.RecognitionConfig(
+    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+    sample_rate_hertz=44100,
+    language_code="ko-KR",
+    model="command_and_search",  # 명령어 인식에 최적화
+    speech_contexts=[speech.SpeechContext(phrases=wake_words + commands)]
+)
+```
+
+### 상태 피드백
+
+#### LED 상태 표시
+- **파란색**: 웨이크워드 대기 중
+- **노란색**: 명령어 인식 중
+- **초록색**: 명령 실행 성공
+- **빨간색**: 오류 발생
+- **보라색**: 시스템 초기화 중
+
+#### 터미널 출력
+```
+🎤 음성 인식 시스템 시작...
+💙 웨이크워드 대기 중... (말해보세요: "헤이 로봇")
+🎯 웨이크워드 감지: "헤이 로봇"
+💛 명령어를 말씀하세요...
+✅ 명령 실행: "토크 켜" → 모든 모터 토크 활성화
+💙 웨이크워드 대기 중...
+```
+
+### 문제 해결
+
+#### 마이크 문제
+```zsh
+# 마이크 장치 확인
+arecord -l
+
+# 테스트 녹음
+arecord -D plughw:4,0 -f cd -d 3 test.wav && aplay test.wav
+```
+
+#### 인증 문제
+```zsh
+# 환경변수 확인
+echo $GOOGLE_APPLICATION_CREDENTIALS
+
+# 키 파일 권한 확인
+ls -l ~/.config/gcloud/service-account-key.json
+```
+
+#### 하드웨어 연결 문제
+```zsh
+# udev 규칙 재로드
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 시리얼 포트 권한 확인
+groups  # dialout 그룹 포함 확인
+```
 
 ---
 
 ## 부팅/실행 자동화(선택)
 
-* 카메라 프리셋: 위 **udev+systemd** 자동화로 이미 처리
-* 스트리밍/손 좌표/팔 추종 실행 자동화는 `systemd` 서비스 2\~3개로 나누는 걸 권장
+### 자동화된 구성 요소
 
-  * `vision@left.service`, `vision@right.service`
-  * `arm_follower.service`
-  * `voice_recognition.service`
-  * 모두 통합 venv(`.venv_cv`) 사용 가능
+#### 이미 자동화된 항목
+- **카메라 프리셋**: udev+systemd로 자동 적용
+- **하드웨어 별칭**: udev 규칙으로 고정 심볼릭 링크
+
+#### 수동 실행 권장 항목
+
+**통합 로거 시스템:**
+```zsh
+# 데이터 수집 + 실시간 화면
+python unified_logger.py --mode continuous --sync --cal-load calibration.json
+
+# 테스트/모니터링
+python unified_logger.py --test --sync
+```
+
+**독립 시스템들:**
+```zsh
+# 로봇팔 동기화만
+python leader_follower_sync.py
+
+# 음성 인식만
+python voice_recognition_improved.py
+
+# 네트워크 스트리밍만
+python scripts/hand_overlay_stream.py --rx <WINDOWS_IP> --port 5001 --pt 96
+```
+
+### Systemd 서비스 구성 (선택적)
+
+스트리밍/로봇 제어를 자동화하려면 systemd 서비스로 구성 가능:
+
+#### 1) 통합 로거 서비스
+
+`/etc/systemd/system/unified-logger.service`:
+```ini
+[Unit]
+Description=Unified Hand Tracking and Robot Arm Logger
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=capdol
+Group=capdol
+WorkingDirectory=/home/capdol/project-2
+Environment=PATH=/home/capdol/project-2/.venv_cv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/capdol/project-2/.venv_cv/bin/python unified_logger.py --mode continuous --sync --cal-load calibration.json
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 2) 음성 인식 서비스
+
+`/etc/systemd/system/voice-recognition.service`:
+```ini
+[Unit]
+Description=Voice Recognition System
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=capdol
+Group=capdol
+WorkingDirectory=/home/capdol/project-2
+Environment=PATH=/home/capdol/project-2/.venv_cv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/home/capdol/.config/gcloud/service-account-key.json
+ExecStart=/home/capdol/project-2/.venv_cv/bin/python voice_recognition_improved.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 3) 스트리밍 서비스 (듀얼 카메라)
+
+`/etc/systemd/system/hand-stream@.service`:
+```ini
+[Unit]
+Description=Hand Overlay Streaming for Camera %i
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=capdol
+Group=capdol
+WorkingDirectory=/home/capdol/project-2
+Environment=PATH=/home/capdol/project-2/.venv_cv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/capdol/project-2/.venv_cv/bin/python scripts/hand_overlay_stream.py --rx 10.96.162.204 --port %i --pt 96 --dev /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0 --w 1280 --h 720 --fps 30 --bitrate 4000 --gop 30
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 서비스 관리
+
+```zsh
+# 서비스 활성화
+sudo systemctl enable unified-logger.service
+sudo systemctl enable voice-recognition.service
+
+# 서비스 시작/중지
+sudo systemctl start unified-logger.service
+sudo systemctl stop unified-logger.service
+
+# 서비스 상태 확인
+sudo systemctl status unified-logger.service
+
+# 로그 확인
+sudo journalctl -u unified-logger.service -f
+```
+
+### 권장 운영 방식
+
+#### 개발/테스트 단계
+- 수동 실행으로 각 기능 테스트
+- 터미널에서 직접 실행하여 디버깅
+
+#### 운영 단계
+- 안정화된 기능만 systemd 자동화
+- 로그 모니터링 시스템 구축
+- 자동 재시작 정책 적용
+
+#### 하이브리드 방식 (권장)
+```zsh
+# 기본 시스템 자동 시작
+sudo systemctl enable voice-recognition.service
+
+# 데이터 수집은 필요시 수동 실행
+python unified_logger.py --mode snapshot --sync
+```
 
 ---
 
 ## 자주 쓰는 확인/디버깅 명령
 
+### 하드웨어 상태 확인
+
+#### 카메라
 ```zsh
-# 장치 나열
+# 카메라 장치 나열
 v4l2-ctl --list-devices
 ls -l /dev/video* /dev/v4l/by-path
 
-# 포맷 확인
+# 카메라 심볼릭 링크 확인
+ls -l /dev/cam_left /dev/cam_right
+
+# 카메라 포맷 및 해상도 확인
 v4l2-ctl --device=/dev/video0 --list-formats-ext
 
-# 현재 컨트롤 확인
+# 현재 카메라 설정 확인
 v4l2-ctl -d /dev/video0 --all
+v4l2-ctl -d /dev/video0 --get-ctrl=brightness,contrast,saturation,auto_exposure,exposure_time_absolute
+```
 
+#### 로봇팔 시리얼 포트
+```zsh
+# 로봇팔 포트 확인
+ls -l /dev/leader_arm /dev/follower_arm
+ls -l /dev/ttyUSB*
+
+# 시리얼 장치 정보
+udevadm info -a -n /dev/leader_arm
+udevadm info -a -n /dev/follower_arm
+
+# udev 규칙 테스트
+sudo udevadm test /sys/class/tty/ttyUSB0
+```
+
+#### 오디오/마이크
+```zsh
+# ALSA 장치 확인
+arecord -l
+arecord -L
+
+# 마이크 테스트
+arecord -D plughw:4,0 -f cd -d 3 test.wav && aplay test.wav
+
+# 마이크 심볼릭 링크 확인
+ls -l /dev/mic_main
+```
+
+#### Arduino
+```zsh
+# Arduino 포트 확인
+ls -l /dev/arduino
+ls -l /dev/ttyACM*
+
+# PlatformIO 장치 확인
+pio device list
+```
+
+### 소프트웨어 상태 확인
+
+#### Python 환경
+```zsh
+# 가상환경 활성화 확인
+which python
+echo $VIRTUAL_ENV
+
+# 주요 패키지 버전 확인
+python - <<'PY'
+import cv2; print("OpenCV:", cv2.__version__)
+import mediapipe; print("MediaPipe:", mediapipe.__version__)
+import dynamixel_sdk; print("Dynamixel SDK: OK")
+from google.cloud import speech; print("Google Cloud Speech: OK")
+print("GStreamer in OpenCV:", "GStreamer" in cv2.getBuildInformation())
+PY
+```
+
+#### GStreamer
+```zsh
 # GStreamer 플러그인 확인
 gst-inspect-1.0 x264enc | head
 gst-inspect-1.0 v4l2src | head
+gst-inspect-1.0 rtph264pay | head
 
-# ALSA
-arecord -l
-arecord -L
+# GStreamer 버전
+gst-launch-1.0 --version
+
+# Python GStreamer 바인딩 확인
+python - <<'PY'
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+print("GStreamer Python bindings: OK")
+PY
+```
+
+### 프로세스 및 네트워크 확인
+
+#### 실행 중인 프로세스
+```zsh
+# Python 스크립트 확인
+ps aux | grep python
+
+# 특정 스크립트 확인
+ps aux | grep unified_logger
+ps aux | grep voice_recognition
+ps aux | grep hand_overlay
+
+# 포트 사용 확인
+sudo netstat -tulpn | grep :5001
+sudo netstat -tulpn | grep :5555
+```
+
+#### systemd 서비스
+```zsh
+# 서비스 상태 확인
+sudo systemctl status unified-logger.service
+sudo systemctl status voice-recognition.service
+
+# 서비스 로그 확인
+sudo journalctl -u unified-logger.service -f
+sudo journalctl -u voice-recognition.service --since "1 hour ago"
+```
+
+### 빠른 기능 테스트
+
+#### 카메라 기본 테스트
+```zsh
+# 기본 카메라 스트림 (5초)
+gst-launch-1.0 v4l2src device=/dev/video0 ! autovideosink
+
+# MJPG 포맷 테스트
+gst-launch-1.0 v4l2src device=/dev/video0 ! image/jpeg,width=1280,height=720 ! jpegdec ! autovideosink
+```
+
+#### 로봇팔 연결 테스트
+```zsh
+# 간단한 연결 테스트
+python - <<'PY'
+from dynamixel_sdk import *
+port = PortHandler("/dev/leader_arm")
+packet = PacketHandler(2.0)
+if port.openPort():
+    print("Leader arm: Connected")
+    port.closePort()
+else:
+    print("Leader arm: Failed")
+
+port = PortHandler("/dev/follower_arm")
+if port.openPort():
+    print("Follower arm: Connected")
+    port.closePort()
+else:
+    print("Follower arm: Failed")
+PY
+```
+
+#### 음성 인식 테스트
+```zsh
+# Google Cloud 인증 확인
+python -c "from google.cloud import speech; print('Google Cloud Speech: OK')"
+
+# 마이크 입력 테스트
+python - <<'PY'
+import pyaudio
+p = pyaudio.PyAudio()
+print("Audio devices:")
+for i in range(p.get_device_count()):
+    info = p.get_device_info_by_index(i)
+    print(f"  {i}: {info['name']} (inputs: {info['maxInputChannels']})")
+p.terminate()
+PY
+```
+
+### 문제 해결 명령
+
+#### 권한 문제
+```zsh
+# 사용자 그룹 확인
+groups
+
+# dialout 그룹 추가 (필요시)
+sudo usermod -a -G dialout $USER
+
+# video 그룹 추가 (필요시)
+sudo usermod -a -G video $USER
+```
+
+#### udev 규칙 재로드
+```zsh
+# udev 규칙 재로드
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 특정 서브시스템만 트리거
+sudo udevadm trigger --subsystem-match=tty
+sudo udevadm trigger --subsystem-match=video4linux
+```
+
+#### 로그 수집
+```zsh
+# 시스템 로그
+sudo journalctl --since "1 hour ago" | grep -E "(video|tty|usb)"
+
+# dmesg (하드웨어 관련)
+dmesg | tail -50
+
+# 특정 장치 로그
+dmesg | grep -i usb
+dmesg | grep -i video
 ```
 
 ---
 
-### 참고/주의
+### 참고/주의사항
 
-* OpenCV **시스템 빌드**를 쓰기 위해 비전 venv는 `--system-site-packages`로 생성.
-* MediaPipe는 CPU 사용량이 큼. 시작은 `--w 960 --h 540 --fps 20 --complexity 0` 추천.
-* Windows 수신 지연은 `rtpjitterbuffer latency=40~60`에서 조정.
-* Dynamixel: 토크 ON 여부 확인 후 목표각 전송. 안전을 위해 각도/속도 제한을 보수적으로.
-* 카메라 컨트롤은 파이프라인 포맷 전환 시 초기화될 수 있어 **스트리밍 직전** 재적용 권장.
+#### Python 환경
+- OpenCV **시스템 빌드**를 쓰기 위해 venv는 `--system-site-packages`로 생성
+- MediaPipe는 CPU 사용량이 높음. 시작 시 해상도 낮추고 복잡도 0으로 설정 권장
+
+#### 성능 최적화
+- **해상도**: 시작은 `--w 960 --h 540 --fps 20` 권장
+- **MediaPipe**: `model_complexity=0`, `max_num_hands=1` 사용
+- **GStreamer**: `bitrate=2000-4000`, `tune=zerolatency` 설정
+
+#### 네트워크 스트리밍
+- Windows 수신 지연은 `rtpjitterbuffer latency=40~60`에서 조정
+- 패킷 손실 시 `mtu=1200` 또는 더 낮게 설정
+- 방화벽에서 UDP 포트 5001, 5003, 5555 허용
+
+#### 로봇팔 안전
+- **토크 상태**: 반드시 토크 ON 여부 확인 후 목표각 전송
+- **각도 제한**: 안전을 위해 각도/속도 제한을 보수적으로 설정
+- **에러 처리**: 연속 통신 에러 시 자동으로 토크 OFF
+
+#### 하드웨어 주의사항
+- **카메라 설정**: 파이프라인 포맷 전환 시 컨트롤 초기화 가능하므로 스트리밍 직전 재적용
+- **USB 전력**: 다수 장치 연결 시 USB 허브 전력 부족 주의
+- **시리얼 충돌**: 동시에 여러 프로그램이 같은 시리얼 포트 접근 시 충돌 발생
+
+#### 데이터 수집
+- **저장 공간**: 연속 기록 시 디스크 용량 모니터링 필요
+- **백업**: 중요한 데이터는 정기적으로 백업
+- **파일명**: 타임스탬프 기반 자동 파일명으로 덮어쓰기 방지
+
+#### 음성 인식
+- **API 비용**: Google Cloud Speech API 사용량 모니터링
+- **네트워크**: 인터넷 연결 필요 (로컬 VAD는 오프라인 동작)
+- **마이크 위치**: 주변 소음 최소화를 위한 마이크 위치 조정
+
+#### 시스템 안정성
+- **메모리**: 장시간 실행 시 메모리 사용량 모니터링
+- **온도**: 고부하 작업 시 Jetson 온도 확인
+- **전력**: 모든 장치 동시 사용 시 전력 공급 충분한지 확인
+
+---
+
+### 업데이트 로그
+
+**2024년 최신 업데이트:**
+- `unified_logger.py`: 통합 로깅 시스템 추가
+- `leader_follower_sync.py`: 로봇팔 동기화 시스템 완성
+- `voice_recognition_improved.py`: 향상된 음성 인식 시스템
+- 실시간 카메라 디스플레이 기능 추가
+- 스냅샷 모드 및 연속 기록 모드 구현
+- Calibration 시스템 자동화
+- systemd 서비스 설정 가이드 추가
+- 종합적인 디버깅 명령어 모음 추가
 
 ---

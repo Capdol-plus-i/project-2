@@ -96,7 +96,7 @@ void setup() {
   pixels.show();
 
   // 시작 시 LED 효과 제거 (바로 꺼진 상태로 시작)
-  // startupEffect();
+  startupEffect();
 
   runner.init();
   runner.addTask(tDisplayStatus);

@@ -59,6 +59,11 @@ class VoiceConfig:
     command_timeout: float = 5.0  # 3초에서 5초로 연장
     max_retries: int = 3
 
+    # 세션 모드 (웨이크워드 후 연속 명령)
+    session_mode: bool = True
+    session_timeout: float = 30.0  # 30초 동안 연속 명령 가능
+    session_idle_timeout: float = 10.0  # 10초 무음 시 세션 종료
+
     # 마이크 설정
     mic_hint: str = "Blue Tiki"
 
@@ -368,17 +373,20 @@ class VoiceRecognitionEngine:
                 return self.listen_for_wake_word(retries + 1)
             return False
 
-    def listen_for_command(self, retries=0):
+    def listen_for_command(self, retries=0, timeout=None):
         """명령어 대기"""
         try:
             cmd_stream, cmd_responses = self.start_stream(is_command_mode=True)
             start_time = time.time()
 
-            print_colored(f"⏱️ 명령 대기 중... ({config.command_timeout}초)", Colors.CYAN)
+            # 타임아웃 설정 (기본값은 config의 command_timeout)
+            command_timeout = timeout if timeout is not None else config.command_timeout
+
+            print_colored(f"⏱️ 명령 대기 중... ({command_timeout}초)", Colors.CYAN)
 
             for cmd_response in cmd_responses:
                 elapsed = time.time() - start_time
-                if elapsed > config.command_timeout:
+                if elapsed > command_timeout:
                     print_colored("\n⏰ 명령 대기 시간 초과", Colors.WARNING)
                     break
 
@@ -425,6 +433,8 @@ class VoiceRecognitionEngine:
         print_colored(f"웨이크워드: {', '.join(config.wake_words)}", Colors.CYAN)
         print_colored(f"명령어: {', '.join(config.command_map.keys())}", Colors.CYAN)
         print_colored(f"감지 임계값: {config.wake_stability_threshold}", Colors.CYAN)
+        if config.session_mode:
+            print_colored(f"세션 모드: 활성화 (세션 시간: {config.session_timeout}초, 무음 종료: {config.session_idle_timeout}초)", Colors.CYAN)
         print_colored("=" * 50, Colors.HEADER)
 
         self.is_listening = True
@@ -435,13 +445,15 @@ class VoiceRecognitionEngine:
                 if self.listen_for_wake_word():
                     time.sleep(0.1)  # 짧은 딜레이
 
-                    # 2. 명령어 대기
-                    command = self.listen_for_command()
-
-                    if command:
-                        # 3. 명령 실행
-                        if not self.execute_command(command):
-                            break  # 종료 명령
+                    if config.session_mode:
+                        # 세션 모드: 연속 명령 처리
+                        self._handle_session_mode()
+                    else:
+                        # 기존 모드: 단일 명령 처리
+                        command = self.listen_for_command()
+                        if command:
+                            if not self.execute_command(command):
+                                break  # 종료 명령
 
                     print_colored("\n" + "="*30, Colors.HEADER)
                     time.sleep(0.5)  # 다음 사이클 전 딜레이
@@ -453,6 +465,48 @@ class VoiceRecognitionEngine:
         finally:
             self.is_listening = False
             print_colored("🛑 음성 인식 시스템 종료", Colors.GREEN)
+
+    def _handle_session_mode(self):
+        """세션 모드 처리 - 웨이크워드 후 연속 명령"""
+        print_colored("🎯 세션 모드 시작 - 연속 명령을 받을 수 있습니다", Colors.GREEN + Colors.BOLD)
+        print_colored("💡 '종료', '세션종료' 또는 무음으로 세션을 종료할 수 있습니다", Colors.CYAN)
+
+        session_start = time.time()
+        last_activity = time.time()
+
+        while True:
+            # 세션 타임아웃 체크
+            if time.time() - session_start > config.session_timeout:
+                print_colored(f"⏰ 세션 시간 초과 ({config.session_timeout}초)", Colors.WARNING)
+                break
+
+            # 무음 타임아웃 체크
+            if time.time() - last_activity > config.session_idle_timeout:
+                print_colored(f"😴 무음으로 인한 세션 종료 ({config.session_idle_timeout}초)", Colors.WARNING)
+                break
+
+            # 명령어 대기 (짧은 타임아웃으로)
+            command = self.listen_for_command(timeout=3.0)
+
+            if command:
+                last_activity = time.time()
+
+                # 세션 종료 명령 체크
+                if command in ["종료", "세션종료", "exit", "quit"]:
+                    print_colored("👋 세션을 종료합니다", Colors.GREEN)
+                    break
+
+                # 시스템 종료 명령
+                if not self.execute_command(command):
+                    self.is_listening = False
+                    break
+
+                print_colored("🎧 다음 명령을 기다리는 중...", Colors.BLUE)
+            else:
+                # 명령이 없으면 짧은 대기
+                time.sleep(0.2)
+
+        print_colored("🏁 세션 모드 종료", Colors.GREEN)
 
 # NeoPixel + 로봇팔 제어 콜백
 def robot_command_callback(command: str):
@@ -495,7 +549,8 @@ def send_arduino_command(cmd: str):
         import serial
         import time
 
-        print_colored(f"  📡 Arduino 명령 전송: {cmd}", Colors.BLUE)
+        print_colored(f"  📡 Arduino 명령 전송 시작: {cmd}", Colors.BLUE)
+        print_colored(f"  🔌 /dev/arduino 포트에 연결 시도...", Colors.CYAN)
 
         # Arduino 시리얼 연결
         with serial.Serial('/dev/arduino', 9600, timeout=2) as ser:
