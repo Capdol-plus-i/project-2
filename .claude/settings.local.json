@@ -16,7 +16,12 @@
       "Bash(sudo usermod:*)",
       "Bash(chmod:*)",
       "Bash(curl:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(source:*)",
+      "Bash(pio:*)",
+      "Read(//home/capdol/**)"
     ],
     "deny": [],
     "ask": []

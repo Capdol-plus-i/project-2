@@ -8,12 +8,12 @@
   "robot_arms": {
     "enabled": true,
     "follower": {
-      "port": "/dev/follower_arm",
+      "port": "/dev/ttyACM2",
       "baudrate": 1000000,
       "enabled": true
     },
     "leader": {
-      "port": "/dev/leader_arm",
+      "port": "/dev/ttyACM1",
       "baudrate": 1000000,
       "enabled": true
     },

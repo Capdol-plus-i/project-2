@@ -17,8 +17,8 @@ def load_hardware_config():
     """Load hardware configuration from hardware_config.json"""
     config_file = 'hardware_config.json'
     default_config = {
-        'leader': {'port': '/dev/ttyACM0', 'baudrate': 1000000},
-        'follower': {'port': '/dev/ttyACM1', 'baudrate': 1000000}
+        'leader': {'port': '/dev/leader_arm', 'baudrate': 1000000},
+        'follower': {'port': '/dev/ttyACM2', 'baudrate': 1000000}
     }
     
     if os.path.exists(config_file):
