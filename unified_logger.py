@@ -75,78 +75,150 @@ class UnifiedLogger:
         """Load hardware configuration from hardware_config.json"""
         config_file = 'hardware_config.json'
         default_config = {
-            'leader': {'port': '/dev/leader_arm', 'baudrate': 1000000},
-            'follower': {'port': '/dev/follower_arm', 'baudrate': 1000000}
+            'robot_arms': {
+                'protocol_version': 2.0,
+                'addr_present_position': 132,
+                'addr_goal_position': 116,
+                'addr_torque_enable': 64,
+                'motor_ids': [1, 2, 3, 4],
+                'leader': {
+                    'port': '/dev/leader_arm',
+                    'baudrate': 1000000,
+                    'enabled': True,
+                    'motors': {
+                        '1': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+                        '2': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+                        '3': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+                        '4': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
+                    }
+                },
+                'follower': {
+                    'port': '/dev/follower_arm',
+                    'baudrate': 1000000,
+                    'enabled': True,
+                    'motors': {
+                        '1': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
+                        '2': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
+                        '3': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
+                        '4': {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
+                    }
+                }
+            },
+            'cameras': {
+                'cam_left': {'id': 0, 'enabled': True},
+                'cam_right': {'id': 2, 'enabled': True}
+            }
         }
 
         if os.path.exists(config_file):
             try:
                 with open(config_file, 'r') as f:
                     config = json.load(f)
-                    robot_config = config.get('robot_arms', {})
-                    self.hw_config = {
+
+                    # Load robot arm configuration
+                    robot_arms_config = config.get('robot_arms', {})
+                    self.robot_arms_config = {
+                        'protocol_version': robot_arms_config.get('protocol_version', default_config['robot_arms']['protocol_version']),
+                        'addr_present_position': robot_arms_config.get('addr_present_position', default_config['robot_arms']['addr_present_position']),
+                        'addr_goal_position': robot_arms_config.get('addr_goal_position', default_config['robot_arms']['addr_goal_position']),
+                        'addr_torque_enable': robot_arms_config.get('addr_torque_enable', default_config['robot_arms']['addr_torque_enable']),
+                        'motor_ids': robot_arms_config.get('motor_ids', default_config['robot_arms']['motor_ids']),
                         'leader': {
-                            'port': robot_config.get('leader', {}).get('port', default_config['leader']['port']),
-                            'baudrate': robot_config.get('leader', {}).get('baudrate', default_config['leader']['baudrate'])
+                            'port': robot_arms_config.get('leader', {}).get('port', default_config['robot_arms']['leader']['port']),
+                            'baudrate': robot_arms_config.get('leader', {}).get('baudrate', default_config['robot_arms']['leader']['baudrate']),
+                            'enabled': robot_arms_config.get('leader', {}).get('enabled', default_config['robot_arms']['leader']['enabled']),
+                            'motors': robot_arms_config.get('leader', {}).get('motors', default_config['robot_arms']['leader']['motors'])
                         },
                         'follower': {
-                            'port': robot_config.get('follower', {}).get('port', default_config['follower']['port']),
-                            'baudrate': robot_config.get('follower', {}).get('baudrate', default_config['follower']['baudrate'])
+                            'port': robot_arms_config.get('follower', {}).get('port', default_config['robot_arms']['follower']['port']),
+                            'baudrate': robot_arms_config.get('follower', {}).get('baudrate', default_config['robot_arms']['follower']['baudrate']),
+                            'enabled': robot_arms_config.get('follower', {}).get('enabled', default_config['robot_arms']['follower']['enabled']),
+                            'motors': robot_arms_config.get('follower', {}).get('motors', default_config['robot_arms']['follower']['motors'])
                         }
                     }
+
+                    # Load camera configuration
+                    camera_config = config.get('cameras', {})
+                    self.camera_config = {
+                        'cam_left': {
+                            'id': camera_config.get('cam_left', {}).get('id', default_config['cameras']['cam_left']['id']),
+                            'enabled': camera_config.get('cam_left', {}).get('enabled', default_config['cameras']['cam_left']['enabled'])
+                        },
+                        'cam_right': {
+                            'id': camera_config.get('cam_right', {}).get('id', default_config['cameras']['cam_right']['id']),
+                            'enabled': camera_config.get('cam_right', {}).get('enabled', default_config['cameras']['cam_right']['enabled'])
+                        }
+                    }
+
             except Exception as e:
                 print(f"Warning: Failed to load hardware config: {e}")
-                self.hw_config = default_config
+                self.robot_arms_config = default_config['robot_arms']
+                self.camera_config = default_config['cameras']
         else:
-            self.hw_config = default_config
+            self.robot_arms_config = default_config['robot_arms']
+            self.camera_config = default_config['cameras']
 
     def init_robot_config(self):
         """Initialize robot arm configuration"""
-        self.PROTOCOL_VERSION = 2.0
-        self.ADDR_PRESENT_POSITION = 132
-        self.ADDR_GOAL_POSITION = 116
-        self.ADDR_TORQUE_ENABLE = 64
-        self.MOTOR_IDS = [1, 2, 3, 4]
+        # Load protocol and address settings from config
+        self.PROTOCOL_VERSION = self.robot_arms_config['protocol_version']
+        self.ADDR_PRESENT_POSITION = self.robot_arms_config['addr_present_position']
+        self.ADDR_GOAL_POSITION = self.robot_arms_config['addr_goal_position']
+        self.ADDR_TORQUE_ENABLE = self.robot_arms_config['addr_torque_enable']
+        self.MOTOR_IDS = self.robot_arms_config['motor_ids']
+
+        # Convert string motor IDs to integers for motors config
+        leader_motors = {}
+        for motor_id_str, motor_config in self.robot_arms_config['leader']['motors'].items():
+            leader_motors[int(motor_id_str)] = motor_config
+
+        follower_motors = {}
+        for motor_id_str, motor_config in self.robot_arms_config['follower']['motors'].items():
+            follower_motors[int(motor_id_str)] = motor_config
 
         self.LEADER_CONFIG = {
-            'port': self.hw_config['leader']['port'],
-            'baudrate': self.hw_config['leader']['baudrate'],
-            'motors': {
-                1: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-                2: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-                3: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-                4: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
-            }
+            'port': self.robot_arms_config['leader']['port'],
+            'baudrate': self.robot_arms_config['leader']['baudrate'],
+            'enabled': self.robot_arms_config['leader']['enabled'],
+            'motors': leader_motors
         }
 
         self.FOLLOWER_CONFIG = {
-            'port': self.hw_config['follower']['port'],
-            'baudrate': self.hw_config['follower']['baudrate'],
-            'motors': {
-                1: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
-                2: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
-                3: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
-                4: {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
-            }
+            'port': self.robot_arms_config['follower']['port'],
+            'baudrate': self.robot_arms_config['follower']['baudrate'],
+            'enabled': self.robot_arms_config['follower']['enabled'],
+            'motors': follower_motors
         }
 
     def init_cameras(self):
         """Initialize dual cameras"""
         print("🎥 Initializing cameras...")
 
-        # Initialize first camera
-        self.cap1 = self.open_camera(0)
-        if not self.cap1:
-            print("❌ Failed to open first camera")
-            return False
-        print("✓ First camera initialized")
-
-        # Initialize second camera
-        self.cap2 = self.open_camera(2)
-        if self.cap2:
-            print("✓ Second camera initialized")
+        # Initialize left camera
+        if self.camera_config['cam_left']['enabled']:
+            # Try symbolic link first, then fallback to config ID
+            self.cap1 = self.open_camera("/dev/cam_left")
+            if not self.cap1:
+                self.cap1 = self.open_camera(self.camera_config['cam_left']['id'])
+            if not self.cap1:
+                print("❌ Failed to open left camera")
+                return False
+            print("✓ Left camera initialized")
         else:
-            print("⚠️ Second camera not available")
+            print("⚠️ Left camera disabled in config")
+
+        # Initialize right camera
+        if self.camera_config['cam_right']['enabled']:
+            # Try symbolic link first, then fallback to config ID
+            self.cap2 = self.open_camera("/dev/cam_right")
+            if not self.cap2:
+                self.cap2 = self.open_camera(self.camera_config['cam_right']['id'])
+            if self.cap2:
+                print("✓ Right camera initialized")
+            else:
+                print("⚠️ Right camera not available")
+        else:
+            print("⚠️ Right camera disabled in config")
 
         # Initialize MediaPipe
         try:
@@ -233,6 +305,10 @@ class UnifiedLogger:
 
     def init_leader_arm(self):
         """Initialize leader robot arm connection"""
+        if not self.LEADER_CONFIG['enabled']:
+            print("⚠️ Leader arm disabled in config")
+            return False
+
         print("🎯 Initializing leader robot arm...")
 
         self.leader_port_handler = PortHandler(self.LEADER_CONFIG['port'])
@@ -252,7 +328,7 @@ class UnifiedLogger:
         self.connected_leader_motors = []
         for motor_id in self.MOTOR_IDS:
             try:
-                model_number, comm_result, error = self.leader_packet_handler.ping(
+                _model_number, comm_result, _error = self.leader_packet_handler.ping(
                     self.leader_port_handler, motor_id)
                 if comm_result == COMM_SUCCESS:
                     self.connected_leader_motors.append(motor_id)
@@ -265,6 +341,10 @@ class UnifiedLogger:
 
     def init_robot_arm(self):
         """Initialize follower robot arm connection"""
+        if not self.FOLLOWER_CONFIG['enabled']:
+            print("⚠️ Follower arm disabled in config")
+            return False
+
         print("🤖 Initializing follower robot arm...")
 
         self.follower_port_handler = PortHandler(self.FOLLOWER_CONFIG['port'])
@@ -284,7 +364,7 @@ class UnifiedLogger:
         self.connected_follower_motors = []
         for motor_id in self.MOTOR_IDS:
             try:
-                model_number, comm_result, error = self.follower_packet_handler.ping(
+                _model_number, comm_result, _error = self.follower_packet_handler.ping(
                     self.follower_port_handler, motor_id)
                 if comm_result == COMM_SUCCESS:
                     self.connected_follower_motors.append(motor_id)
@@ -298,26 +378,26 @@ class UnifiedLogger:
     def get_hand_coordinates_with_frames(self, draw_landmarks=False):
         """Get hand coordinates from both cameras with frames"""
         coords = {
-            'cam1_x': None, 'cam1_y': None,
-            'cam2_x': None, 'cam2_y': None
+            'cam_left_x': None, 'cam_left_y': None,
+            'cam_right_x': None, 'cam_right_y': None
         }
-        frames = {'frame1': None, 'frame2': None}
+        frames = {'frame_left': None, 'frame_right': None}
 
-        # Process camera 1
+        # Process left camera
         if self.cap1:
-            frame1, finger_coords1 = self.process_frame(self.cap1, self.hands1, draw_landmarks)
-            frames['frame1'] = frame1
-            if finger_coords1:
-                coords['cam1_x'] = finger_coords1[0]['index_tip'][0]
-                coords['cam1_y'] = finger_coords1[0]['index_tip'][1]
+            frame_left, finger_coords_left = self.process_frame(self.cap1, self.hands1, draw_landmarks)
+            frames['frame_left'] = frame_left
+            if finger_coords_left:
+                coords['cam_left_x'] = finger_coords_left[0]['index_tip'][0]
+                coords['cam_left_y'] = finger_coords_left[0]['index_tip'][1]
 
-        # Process camera 2
+        # Process right camera
         if self.cap2:
-            frame2, finger_coords2 = self.process_frame(self.cap2, self.hands2, draw_landmarks)
-            frames['frame2'] = frame2
-            if finger_coords2:
-                coords['cam2_x'] = finger_coords2[0]['index_tip'][0]
-                coords['cam2_y'] = finger_coords2[0]['index_tip'][1]
+            frame_right, finger_coords_right = self.process_frame(self.cap2, self.hands2, draw_landmarks)
+            frames['frame_right'] = frame_right
+            if finger_coords_right:
+                coords['cam_right_x'] = finger_coords_right[0]['index_tip'][0]
+                coords['cam_right_y'] = finger_coords_right[0]['index_tip'][1]
 
         return coords, frames
 
@@ -378,7 +458,7 @@ class UnifiedLogger:
                     else:
                         # Use last known position if read fails
                         positions[f'follower_pos{i}'] = self.last_robot_positions[f'follower_pos{i}']
-                except Exception as e:
+                except Exception:
                     # Use last known position on exception
                     positions[f'follower_pos{i}'] = self.last_robot_positions[f'follower_pos{i}']
 
@@ -396,7 +476,7 @@ class UnifiedLogger:
         else:
             return None, None, False
 
-    def set_motor_position(self, port_handler, packet_handler, motor_id, position, config):
+    def set_motor_position(self, port_handler, packet_handler, motor_id, position, _config=None):
         """Set goal position for a specific motor"""
         position = max(0, min(4095, int(position)))
 
@@ -547,7 +627,7 @@ class UnifiedLogger:
 
         # Write header
         header = [
-            'timestamp', 'cam1_x', 'cam1_y', 'cam2_x', 'cam2_y',
+            'timestamp', 'cam_left_x', 'cam_left_y', 'cam_right_x', 'cam_right_y',
             'follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4'
         ]
         self.csv_writer.writerow(header)
@@ -580,8 +660,8 @@ class UnifiedLogger:
         if self.csv_writer:
             row = [
                 data_point['timestamp'],
-                data_point['cam1_x'], data_point['cam1_y'],
-                data_point['cam2_x'], data_point['cam2_y'],
+                data_point['cam_left_x'], data_point['cam_left_y'],
+                data_point['cam_right_x'], data_point['cam_right_y'],
                 data_point['follower_pos1'], data_point['follower_pos2'],
                 data_point['follower_pos3'], data_point['follower_pos4']
             ]
@@ -614,27 +694,27 @@ class UnifiedLogger:
                 count += 1
 
                 # Display camera frames
-                if frames['frame1'] is not None:
-                    cv2.putText(frames['frame1'], f"Recording - Frame #{count}",
+                if frames['frame_left'] is not None:
+                    cv2.putText(frames['frame_left'], f"Recording - Frame #{count}",
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    cv2.putText(frames['frame1'], "Ctrl+C: Stop Recording",
-                              (10, frames['frame1'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.imshow('Camera 1 - Recording', frames['frame1'])
+                    cv2.putText(frames['frame_left'], "Ctrl+C: Stop Recording",
+                              (10, frames['frame_left'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.imshow('Left Camera - Recording', frames['frame_left'])
 
-                if frames['frame2'] is not None:
-                    cv2.putText(frames['frame2'], f"Recording - Frame #{count}",
+                if frames['frame_right'] is not None:
+                    cv2.putText(frames['frame_right'], f"Recording - Frame #{count}",
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    cv2.imshow('Camera 2 - Recording', frames['frame2'])
+                    cv2.imshow('Right Camera - Recording', frames['frame_right'])
 
                 # Update terminal display every 10 samples
                 if count % 10 == 0:
-                    hand_status = "👋" if (data_point['cam1_x'] or data_point['cam2_x']) else "🚫"
+                    hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
                     robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
                     sync_status = "🔄" if self.sync_active else "⏸️"
 
                     print(f"\r📊 [{count:4d}] {hand_status} {robot_status} {sync_status} | "
-                          f"C1:({data_point['cam1_x']},{data_point['cam1_y']}) "
-                          f"C2:({data_point['cam2_x']},{data_point['cam2_y']}) "
+                          f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
+                          f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                           f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
                           f"{data_point['follower_pos3']},{data_point['follower_pos4']}]", end="", flush=True)
 
@@ -646,6 +726,7 @@ class UnifiedLogger:
 
         except KeyboardInterrupt:
             self.recording = False
+            print("\n🛑 Ctrl+C pressed, stopping recording...")
 
         cv2.destroyAllWindows()
         print(f"\n🛑 Recording stopped. Total: {count} data points")
@@ -673,33 +754,33 @@ class UnifiedLogger:
                 }
 
                 # Display camera frames
-                if frames['frame1'] is not None:
+                if frames['frame_left'] is not None:
                     # Add status info to frame
-                    cv2.putText(frames['frame1'], f"Camera 1 - Snapshot #{snapshot_count + 1}",
+                    cv2.putText(frames['frame_left'], f"Left Camera - Snapshot #{snapshot_count + 1}",
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.putText(frames['frame1'], "SPACE: Snapshot | ESC: Quit",
-                              (10, frames['frame1'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.imshow('Camera 1', frames['frame1'])
+                    cv2.putText(frames['frame_left'], "SPACE: Snapshot | ESC: Quit",
+                              (10, frames['frame_left'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.imshow('Left Camera', frames['frame_left'])
 
-                if frames['frame2'] is not None:
-                    cv2.putText(frames['frame2'], f"Camera 2 - Snapshot #{snapshot_count + 1}",
+                if frames['frame_right'] is not None:
+                    cv2.putText(frames['frame_right'], f"Right Camera - Snapshot #{snapshot_count + 1}",
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.imshow('Camera 2', frames['frame2'])
+                    cv2.imshow('Right Camera', frames['frame_right'])
 
                 # Show current status in terminal
-                hand_status = "👋" if (data_point['cam1_x'] or data_point['cam2_x']) else "🚫"
+                hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
                 robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
                 sync_status = "🔄" if self.sync_active else "⏸️"
 
                 print(f"\r{hand_status} {robot_status} {sync_status} | "
-                      f"C1:({data_point['cam1_x']},{data_point['cam1_y']}) "
-                      f"C2:({data_point['cam2_x']},{data_point['cam2_y']}) "
+                      f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
+                      f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                       f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
                       f"{data_point['follower_pos3']},{data_point['follower_pos4']}] "
                       f"| Snapshots: {snapshot_count}", end="", flush=True)
 
                 # Check for key press
-                key = cv2.waitKey(1) & 0xFF
+                key = cv2.waitKey(30) & 0xFF
                 if key == ord(' '):  # Spacebar for snapshot
                     self.record_data_point(data_point)
                     snapshot_count += 1
@@ -721,6 +802,14 @@ class UnifiedLogger:
         self.snapshot_mode = False
         self.running = False
 
+        # Stop synchronization if active (this will disable torques)
+        if self.sync_active:
+            self.stop_synchronization()
+
+        # Ensure follower torques are disabled (safe to call multiple times)
+        if self.follower_port_handler and self.connected_follower_motors:
+            self.disable_follower_torques()
+
         # Close cameras
         if self.cap1:
             self.cap1.release()
@@ -728,7 +817,9 @@ class UnifiedLogger:
             self.cap2.release()
         cv2.destroyAllWindows()
 
-        # Close robot arm connection
+        # Close robot arm connections
+        if self.leader_port_handler:
+            self.leader_port_handler.closePort()
         if self.follower_port_handler:
             self.follower_port_handler.closePort()
 
@@ -767,7 +858,10 @@ class UnifiedLogger:
         time.sleep(0.2)
 
         # Disable follower torques
-        self.disable_follower_torques()
+        if self.follower_port_handler and self.connected_follower_motors:
+            self.disable_follower_torques()
+        else:
+            print("⚠️  Follower arm not available for torque disable")
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Hand Tracking and Robot Arm Logger")
@@ -782,7 +876,7 @@ def main():
     logger = UnifiedLogger()
 
     # Setup signal handler
-    def signal_handler(sig, frame):
+    def signal_handler(_sig, _frame):
         logger.cleanup()
         sys.exit(0)
     signal.signal(signal.SIGINT, signal_handler)
@@ -829,26 +923,26 @@ def main():
                     }
 
                     # Display camera frames
-                    if frames['frame1'] is not None:
-                        cv2.putText(frames['frame1'], "Test Mode - No Recording",
+                    if frames['frame_left'] is not None:
+                        cv2.putText(frames['frame_left'], "Test Mode - No Recording",
                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                        cv2.putText(frames['frame1'], "Ctrl+C or ESC: Stop",
-                                  (10, frames['frame1'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.imshow('Camera 1 - Test Mode', frames['frame1'])
+                        cv2.putText(frames['frame_left'], "Ctrl+C or ESC: Stop",
+                                  (10, frames['frame_left'].shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.imshow('Left Camera - Test Mode', frames['frame_left'])
 
-                    if frames['frame2'] is not None:
-                        cv2.putText(frames['frame2'], "Test Mode - No Recording",
+                    if frames['frame_right'] is not None:
+                        cv2.putText(frames['frame_right'], "Test Mode - No Recording",
                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                        cv2.imshow('Camera 2 - Test Mode', frames['frame2'])
+                        cv2.imshow('Right Camera - Test Mode', frames['frame_right'])
 
                     # Terminal display
-                    hand_status = "👋" if (data_point['cam1_x'] or data_point['cam2_x']) else "🚫"
+                    hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
                     robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
                     sync_status = "🔄" if logger.sync_active else "⏸️"
 
                     print(f"\r{hand_status} {robot_status} {sync_status} | "
-                          f"C1:({data_point['cam1_x']},{data_point['cam1_y']}) "
-                          f"C2:({data_point['cam2_x']},{data_point['cam2_y']}) "
+                          f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
+                          f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                           f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
                           f"{data_point['follower_pos3']},{data_point['follower_pos4']}]", end="", flush=True)
 
@@ -858,17 +952,15 @@ def main():
 
                     time.sleep(0.2)
             except KeyboardInterrupt:
-                pass
+                print("\n🛑 Ctrl+C pressed, stopping test mode...")
             finally:
                 cv2.destroyAllWindows()
-                if logger.sync_active:
-                    logger.stop_synchronization()
         else:
             # Initialize output file
-            output_filename = logger.init_output_file(args.output)
+            logger.init_output_file(args.output)
 
             print("✅ All systems initialized successfully")
-            print(f"📊 Data format: timestamp, cam1_x, cam1_y, cam2_x, cam2_y, follower_pos1-4")
+            print(f"📊 Data format: timestamp, cam_left_x, cam_left_y, cam_right_x, cam_right_y, follower_pos1-4")
             if args.sync:
                 print("🔄 Leader-follower synchronization will be active during recording")
             print("=" * 60)
@@ -884,8 +976,7 @@ def main():
                 else:
                     logger.start_snapshot_mode()
             finally:
-                if logger.sync_active:
-                    logger.stop_synchronization()
+                pass  # cleanup() will handle sync stop and torque disable
 
     except Exception as e:
         print(f"❌ Error: {e}")

@@ -7,25 +7,42 @@
   },
   "robot_arms": {
     "enabled": true,
+    "protocol_version": 2.0,
+    "addr_present_position": 132,
+    "addr_goal_position": 116,
+    "addr_torque_enable": 64,
+    "motor_ids": [1, 2, 3, 4],
     "follower": {
       "port": "/dev/follower_arm",
       "baudrate": 1000000,
-      "enabled": true
+      "enabled": true,
+      "motors": {
+        "1": {"model": "XL430-W250-T", "center": 2048, "resolution": 0.088},
+        "2": {"model": "XL430-W250-T", "center": 2048, "resolution": 0.088},
+        "3": {"model": "XL430-W250-T", "center": 2048, "resolution": 0.088},
+        "4": {"model": "XL330-M288-T", "center": 2048, "resolution": 0.088}
+      }
     },
     "leader": {
       "port": "/dev/leader_arm",
       "baudrate": 1000000,
-      "enabled": true
+      "enabled": true,
+      "motors": {
+        "1": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
+        "2": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
+        "3": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
+        "4": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088}
+      }
     },
     "auto_detect": true
   },
   "cameras": {
     "enabled": true,
-    "camera1": {
+    "cam_left": {
       "id": 0,
       "enabled": true
     },
-    "camera2": {
+    "cam_right": {
       "id": 2,
       "enabled": true
     },

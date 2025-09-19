@@ -208,26 +208,20 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ---
 
-## 카메라 프리셋(밝기/노출 등) 자동 적용
+## 카메라 프리셋(대조/채도) 자동 적용
 
 **목표 값**
 
-* `brightness=20, contrast=180, saturation=200, hue=0, gamma=80`
-* `auto_exposure=Manual(1), exposure_time_absolute=78`
+* `contrast=255, saturation=255`
 
 ### 1) 즉시 적용 (양쪽)
 
-```zsh
+```bash
 LEFT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0
 RIGHT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0
 
-sudo v4l2-ctl -d "$LEFT"  --set-ctrl=auto_exposure=1
-sudo v4l2-ctl -d "$LEFT"  --set-ctrl=exposure_time_absolute=78
-sudo v4l2-ctl -d "$LEFT"  --set-ctrl=brightness=20,contrast=180,saturation=200,hue=0,gamma=80
-
-sudo v4l2-ctl -d "$RIGHT" --set-ctrl=auto_exposure=1
-sudo v4l2-ctl -d "$RIGHT" --set-ctrl=exposure_time_absolute=78
-sudo v4l2-ctl -d "$RIGHT" --set-ctrl=brightness=20,contrast=180,saturation=200,hue=0,gamma=80
+sudo v4l2-ctl -d "$LEFT"  --set-ctrl=contrast=255,saturation=255
+sudo v4l2-ctl -d "$RIGHT" --set-ctrl=contrast=255,saturation=255
 ```
 
 > **순서 중요**: 수동노출 → 노출값 → 나머지.

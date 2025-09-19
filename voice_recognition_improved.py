@@ -25,6 +25,81 @@ import pyaudio
 import webrtcvad
 from google.cloud import speech
 
+# Arduino Terminal 통합
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("⚠️ pyserial 모듈이 없습니다. Arduino 제어가 비활성화됩니다.")
+
+# Arduino Terminal 클래스 (arduino_terminal.py에서 가져옴)
+class ArduinoTerminal:
+    def __init__(self):
+        self.ser = None
+        self.listening = False
+        self.listener_thread = None
+
+    def connect(self):
+        """Arduino 연결"""
+        if not SERIAL_AVAILABLE:
+            print_colored("❌ pyserial 모듈이 필요합니다: pip install pyserial", Colors.FAIL)
+            return False
+
+        try:
+            print_colored("🔌 Arduino 연결 중...", Colors.CYAN)
+            self.ser = serial.Serial('/dev/arduino', 9600, timeout=1)
+            time.sleep(2)  # Arduino 부팅 대기
+            print_colored("✓ Arduino 연결 성공!", Colors.GREEN)
+
+            # 연결 후 상태 확인
+            self.send_command("STATUS")
+            return True
+
+        except serial.SerialException as e:
+            print_colored(f"❌ Arduino 연결 실패: {e}", Colors.FAIL)
+            print_colored("확인사항: /dev/arduino 장치가 연결되어 있는지 확인하세요", Colors.WARNING)
+            return False
+        except Exception as e:
+            print_colored(f"❌ 예상치 못한 오류: {e}", Colors.FAIL)
+            return False
+
+    def send_command(self, command):
+        """Arduino에 명령 전송"""
+        if not self.ser or not self.ser.is_open:
+            print_colored("❌ Arduino가 연결되지 않음", Colors.FAIL)
+            return False
+
+        try:
+            print_colored(f"📡 전송: {command}", Colors.BLUE)
+            self.ser.write(f"{command}\n".encode('utf-8'))
+            self.ser.flush()
+
+            # 응답 대기
+            time.sleep(0.2)
+            if self.ser.in_waiting > 0:
+                try:
+                    raw_data = self.ser.readline()
+                    response = raw_data.decode('utf-8', errors='ignore').strip()
+                    if response:
+                        clean_response = ''.join(char for char in response if ord(char) < 128)
+                        if clean_response:
+                            print_colored(f"📨 Arduino: {clean_response}", Colors.GREEN)
+                except Exception:
+                    pass
+
+            return True
+
+        except Exception as e:
+            print_colored(f"❌ 전송 실패: {e}", Colors.FAIL)
+            return False
+
+    def disconnect(self):
+        """Arduino 연결 종료"""
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            print_colored("🔌 Arduino 연결 종료", Colors.GREEN)
+
 # ---- gRPC 경고 억제 ----
 os.environ.setdefault("GRPC_VERBOSITY", "NONE")
 os.environ.setdefault("GRPC_LOG_SEVERITY_LEVEL", "ERROR")
@@ -64,6 +139,10 @@ class VoiceConfig:
     session_timeout: float = 30.0  # 30초 동안 연속 명령 가능
     session_idle_timeout: float = 10.0  # 10초 무음 시 세션 종료
 
+    # 연속 모드 (웨이크워드 없이 항상 명령어 대기)
+    continuous_mode: bool = True  # True: 연속 모드, False: 웨이크워드 모드
+    continuous_timeout: float = 2.0  # 연속 모드에서 명령어 대기 시간
+
     # 마이크 설정
     mic_hint: str = "Blue Tiki"
 
@@ -97,7 +176,11 @@ class VoiceConfig:
                 "초기화": ["초기화", "리셋", "센터", "중앙", "홈"],
 
                 # 시스템
-                "종료": ["종료", "끝내", "종료해", "그만", "바이"]
+                "종료": ["종료", "끝내", "종료해", "그만", "바이"],
+                "아두이노연결": ["아두이노연결", "아두이노 연결", "Arduino 연결", "연결확인"],
+                "상태확인": ["상태확인", "상태 확인", "STATUS", "status"],
+                "웨이크워드모드": ["웨이크워드모드", "웨이크워드 모드", "웨이크모드"],
+                "연속모드": ["연속모드", "연속 모드", "계속모드"]
             }
 
 # 전역 설정
@@ -262,6 +345,8 @@ class VoiceRecognitionEngine:
     def __init__(self):
         self.is_listening = False
         self.command_callback = None
+        self.arduino_terminal = ArduinoTerminal()
+        self.arduino_connected = False
 
     def set_command_callback(self, callback):
         """명령 실행 콜백 설정"""
@@ -373,21 +458,25 @@ class VoiceRecognitionEngine:
                 return self.listen_for_wake_word(retries + 1)
             return False
 
-    def listen_for_command(self, retries=0, timeout=None):
+    def listen_for_command(self, retries=0, timeout=None, continuous_mode=False):
         """명령어 대기"""
         try:
-            cmd_stream, cmd_responses = self.start_stream(is_command_mode=True)
+            cmd_stream, cmd_responses = self.start_stream(is_command_mode=not continuous_mode)
             start_time = time.time()
 
             # 타임아웃 설정 (기본값은 config의 command_timeout)
             command_timeout = timeout if timeout is not None else config.command_timeout
 
-            print_colored(f"⏱️ 명령 대기 중... ({command_timeout}초)", Colors.CYAN)
+            if not continuous_mode:
+                print_colored(f"⏱️ 명령 대기 중... ({command_timeout}초)", Colors.CYAN)
+
+            last_transcript = ""
 
             for cmd_response in cmd_responses:
                 elapsed = time.time() - start_time
                 if elapsed > command_timeout:
-                    print_colored("\n⏰ 명령 대기 시간 초과", Colors.WARNING)
+                    if not continuous_mode:
+                        print_colored("\n⏰ 명령 대기 시간 초과", Colors.WARNING)
                     break
 
                 if not cmd_response.results:
@@ -399,29 +488,42 @@ class VoiceRecognitionEngine:
 
                 cmd_transcript = normalize(cmd_result.alternatives[0].transcript.strip())
 
-                if cmd_transcript:
-                    print_colored(f"  📝 명령: {cmd_transcript}", Colors.BLUE)
+                if cmd_transcript and cmd_transcript != last_transcript:
+                    if continuous_mode:
+                        # 연속 모드에서는 실시간 표시
+                        if cmd_result.is_final:
+                            print_colored(f"  📝 인식: {cmd_transcript}", Colors.BLUE)
+                        else:
+                            print(f"\r  📝 듣는 중: {cmd_transcript}", end="", flush=True)
+                    else:
+                        print_colored(f"  📝 명령: {cmd_transcript}", Colors.BLUE)
 
-                    # 명령어 매칭
-                    for cmd, variations in config.command_map.items():
-                        if any(normalize(v) in cmd_transcript for v in variations):
-                            cmd_stream.__exit__(None, None, None)
-                            return cmd
+                    # 명령어 매칭 (final 결과에서만)
+                    if cmd_result.is_final or not continuous_mode:
+                        for cmd, variations in config.command_map.items():
+                            if any(normalize(v) in cmd_transcript for v in variations):
+                                cmd_stream.__exit__(None, None, None)
+                                if continuous_mode:
+                                    print()  # 줄바꿈
+                                return cmd
+
+                        # 연속 모드에서 잘못된 명령은 무시하고 계속
+                        if continuous_mode and cmd_result.is_final:
+                            print()  # 줄바꿈
+                            print_colored(f"  ❓ 알 수 없는 명령: {cmd_transcript}", Colors.WARNING)
+                            # 스트림을 유지하고 계속 듣기
+                            start_time = time.time()  # 타이머 리셋
+
+                    last_transcript = cmd_transcript
 
             cmd_stream.__exit__(None, None, None)
 
-            if retries < config.max_retries:
-                print_colored(f"❓ 명령을 인식하지 못했습니다. 다시 시도합니다. ({retries+1}/{config.max_retries})", Colors.WARNING)
-                return self.listen_for_command(retries + 1)
-            else:
-                print_colored("❌ 명령 인식에 실패했습니다.", Colors.FAIL)
-                return None
+            # 재시도는 상위 함수에서 처리
+            return None
 
         except Exception as e:
             print_colored(f"❌ 명령 인식 오류: {e}", Colors.FAIL)
-            if retries < config.max_retries:
-                time.sleep(1)
-                return self.listen_for_command(retries + 1)
+            # 재시도는 상위 함수에서 처리
             return None
 
     def run(self):
@@ -430,33 +532,44 @@ class VoiceRecognitionEngine:
         print_colored("=" * 50, Colors.HEADER)
 
         # 설정 정보 출력
-        print_colored(f"웨이크워드: {', '.join(config.wake_words)}", Colors.CYAN)
-        print_colored(f"명령어: {', '.join(config.command_map.keys())}", Colors.CYAN)
-        print_colored(f"감지 임계값: {config.wake_stability_threshold}", Colors.CYAN)
-        if config.session_mode:
-            print_colored(f"세션 모드: 활성화 (세션 시간: {config.session_timeout}초, 무음 종료: {config.session_idle_timeout}초)", Colors.CYAN)
+        mode_text = "연속 모드 (웨이크워드 불필요)" if config.continuous_mode else "웨이크워드 모드"
+        print_colored(f"인식 모드: {mode_text}", Colors.CYAN + Colors.BOLD)
+
+        if not config.continuous_mode:
+            wake_words = config.wake_words or []
+            print_colored(f"웨이크워드: {', '.join(wake_words)}", Colors.CYAN)
+            print_colored(f"감지 임계값: {config.wake_stability_threshold}", Colors.CYAN)
+            if config.session_mode:
+                print_colored(f"세션 모드: 활성화 (세션 시간: {config.session_timeout}초, 무음 종료: {config.session_idle_timeout}초)", Colors.CYAN)
+        else:
+            print_colored(f"연속 인식 타임아웃: {config.continuous_timeout}초", Colors.CYAN)
+
+        command_keys = list(config.command_map.keys()) if config.command_map else []
+        print_colored(f"사용 가능한 명령어: {', '.join(command_keys[:8])}...", Colors.CYAN)
+        print_colored("💡 '웨이크워드모드' 또는 '연속모드'로 모드 전환 가능", Colors.WARNING)
         print_colored("=" * 50, Colors.HEADER)
 
         self.is_listening = True
 
         try:
             while self.is_listening:
-                # 1. 웨이크워드 대기
-                if self.listen_for_wake_word():
-                    time.sleep(0.1)  # 짧은 딜레이
+                if config.continuous_mode:
+                    # 연속 모드: 웨이크워드 없이 항상 명령어 대기
+                    self._handle_continuous_mode()
+                else:
+                    # 웨이크워드 모드: 기존 방식
+                    if self.listen_for_wake_word():
+                        time.sleep(0.1)  # 짧은 딜레이
 
-                    if config.session_mode:
-                        # 세션 모드: 연속 명령 처리
-                        self._handle_session_mode()
-                    else:
-                        # 기존 모드: 단일 명령 처리
-                        command = self.listen_for_command()
-                        if command:
-                            if not self.execute_command(command):
-                                break  # 종료 명령
+                        if config.session_mode:
+                            # 세션 모드: 연속 명령 처리
+                            self._handle_session_mode()
+                        else:
+                            # 기존 모드: 올바른 명령어가 들어올 때까지 계속 시도
+                            self._handle_single_command_mode()
 
-                    print_colored("\n" + "="*30, Colors.HEADER)
-                    time.sleep(0.5)  # 다음 사이클 전 딜레이
+                        print_colored("\n" + "="*30, Colors.HEADER)
+                        time.sleep(0.5)  # 다음 사이클 전 딜레이
 
         except KeyboardInterrupt:
             print_colored("\n^C 사용자 중단", Colors.WARNING)
@@ -503,10 +616,129 @@ class VoiceRecognitionEngine:
 
                 print_colored("🎧 다음 명령을 기다리는 중...", Colors.BLUE)
             else:
-                # 명령이 없으면 짧은 대기
-                time.sleep(0.2)
+                # 명령이 없으면 계속 시도 (세션 모드에서는 더 관대하게)
+                print_colored("🔄 명령을 다시 말씀해주세요...", Colors.CYAN)
+                time.sleep(0.5)
 
         print_colored("🏁 세션 모드 종료", Colors.GREEN)
+
+    def _handle_single_command_mode(self):
+        """단일 명령 모드 처리 - 올바른 명령어가 들어올 때까지 계속 시도"""
+        print_colored("🎯 명령어를 말씀하세요", Colors.GREEN + Colors.BOLD)
+        print_colored("💡 올바른 명령어가 인식될 때까지 계속 시도합니다", Colors.CYAN)
+
+        max_attempts = 5  # 최대 시도 횟수
+        attempt = 0
+
+        while attempt < max_attempts:
+            attempt += 1
+            print_colored(f"🎤 명령어 대기 중... ({attempt}/{max_attempts})", Colors.BLUE)
+
+            command = self.listen_for_command(retries=0, timeout=config.command_timeout)
+
+            if command:
+                print_colored(f"✅ 명령어 인식됨: {command}", Colors.GREEN)
+                if not self.execute_command(command):
+                    self.is_listening = False  # 종료 명령
+                break
+            else:
+                if attempt < max_attempts:
+                    print_colored(f"❓ 명령어를 인식하지 못했습니다. 다시 시도해주세요. ({attempt}/{max_attempts})", Colors.WARNING)
+                    time.sleep(0.5)  # 짧은 대기
+                else:
+                    print_colored("❌ 최대 시도 횟수를 초과했습니다. 웨이크워드부터 다시 시작합니다.", Colors.FAIL)
+
+        print_colored("🔚 명령 처리 완료", Colors.GREEN)
+
+    def _handle_continuous_mode(self):
+        """연속 모드 처리 - 웨이크워드 없이 항상 명령어 대기"""
+        print_colored("🎧 연속 모드 - 언제든지 명령어를 말씀하세요", Colors.GREEN + Colors.BOLD)
+
+        while self.is_listening and config.continuous_mode:
+            try:
+                # 매번 새로운 스트림으로 명령어 듣기
+                print_colored("🔊 명령어를 말씀하세요...", Colors.CYAN)
+
+                cmd_stream, cmd_responses = self.start_stream(is_command_mode=False)
+                last_transcript = ""
+
+                for cmd_response in cmd_responses:
+                    if not self.is_listening or not config.continuous_mode:
+                        break
+
+                    if not cmd_response.results:
+                        continue
+
+                    cmd_result = cmd_response.results[0]
+                    if not cmd_result.alternatives:
+                        continue
+
+                    cmd_transcript = normalize(cmd_result.alternatives[0].transcript.strip())
+
+                    if cmd_transcript and cmd_transcript != last_transcript:
+                        # 실시간 표시
+                        if cmd_result.is_final:
+                            print_colored(f"  📝 인식: {cmd_transcript}", Colors.BLUE)
+                        else:
+                            print(f"\r  📝 듣는 중: {cmd_transcript}", end="", flush=True)
+
+                        # 명령어 매칭 (final 결과에서만)
+                        if cmd_result.is_final:
+                            command = None
+                            command_map = config.command_map or {}
+                            for cmd, variations in command_map.items():
+                                if any(normalize(v) in cmd_transcript for v in variations):
+                                    command = cmd
+                                    break
+
+                            if command:
+                                print()  # 줄바꿈
+                                print_colored(f"✅ 명령어 인식: {command}", Colors.GREEN)
+
+                                # 모드 변경 명령 체크
+                                if command == "웨이크워드모드":
+                                    print_colored("🔄 웨이크워드 모드로 전환합니다", Colors.CYAN)
+                                    config.continuous_mode = False
+                                    cmd_stream.__exit__(None, None, None)
+                                    return
+                                elif command == "연속모드":
+                                    print_colored("✓ 이미 연속 모드입니다", Colors.GREEN)
+                                    cmd_stream.__exit__(None, None, None)
+                                    break
+
+                                # 일반 명령 실행
+                                if not self.execute_command(command):
+                                    self.is_listening = False
+                                    cmd_stream.__exit__(None, None, None)
+                                    return
+
+                                print_colored("🎧 계속 듣고 있습니다...", Colors.BLUE)
+                                cmd_stream.__exit__(None, None, None)
+                                break
+                            else:
+                                print()  # 줄바꿈
+                                print_colored(f"  ❓ 알 수 없는 명령: {cmd_transcript}", Colors.WARNING)
+                                # 잘못된 명령이어도 스트림을 종료하고 다시 시작
+                                cmd_stream.__exit__(None, None, None)
+                                break
+
+                        last_transcript = cmd_transcript
+
+                # 스트림 정리 (만약 아직 열려있다면)
+                try:
+                    cmd_stream.__exit__(None, None, None)
+                except:
+                    pass
+
+                # 짧은 대기 후 다시 시작 (CPU 사용량 줄이기)
+                if self.is_listening and config.continuous_mode:
+                    time.sleep(0.1)
+
+            except Exception as e:
+                print_colored(f"❌ 연속 모드 오류: {e}", Colors.FAIL)
+                time.sleep(1)  # 오류 발생 시 1초 대기 후 재시도
+
+        print_colored("🔚 연속 모드 종료", Colors.GREEN)
 
 # NeoPixel + 로봇팔 제어 콜백
 def robot_command_callback(command: str):
@@ -534,62 +766,55 @@ def robot_command_callback(command: str):
         "초기화": lambda: reset_arm_position(),
     }
 
+    # 시스템 제어 명령
+    system_commands = {
+        "아두이노연결": lambda: reconnect_arduino(),
+        "상태확인": lambda: check_arduino_status(),
+        "웨이크워드모드": lambda: switch_to_wake_word_mode(),
+        "연속모드": lambda: switch_to_continuous_mode(),
+    }
+
     if command in light_commands:
         print_colored(f"💡 조명 제어: {command}", Colors.CYAN)
         light_commands[command]()
     elif command in follow_commands:
         print_colored(f"🦾 로봇팔 제어: {command}", Colors.GREEN)
         follow_commands[command]()
+    elif command in system_commands:
+        print_colored(f"⚙️ 시스템 제어: {command}", Colors.BLUE)
+        system_commands[command]()
     else:
         print_colored(f"❓ 알 수 없는 명령: {command}", Colors.WARNING)
 
+# 전역 Arduino 터미널 인스턴스
+_global_arduino = None
+
+def get_arduino_terminal():
+    """전역 Arduino 터미널 인스턴스 반환"""
+    global _global_arduino
+    if _global_arduino is None:
+        _global_arduino = ArduinoTerminal()
+        # 초기 연결 시도
+        if SERIAL_AVAILABLE:
+            _global_arduino.connect()
+    return _global_arduino
+
 def send_arduino_command(cmd: str):
-    """Arduino에 NeoPixel 제어 명령 전송"""
-    try:
-        import serial
-        import time
-
-        print_colored(f"  📡 Arduino 명령 전송 시작: {cmd}", Colors.BLUE)
-        print_colored(f"  🔌 /dev/arduino 포트에 연결 시도...", Colors.CYAN)
-
-        # Arduino 시리얼 연결
-        with serial.Serial('/dev/arduino', 9600, timeout=2) as ser:
-            time.sleep(0.1)  # Arduino 준비 시간
-
-            # 명령 전송
-            command_line = f"{cmd}\n"
-            ser.write(command_line.encode('utf-8'))
-            ser.flush()
-
-            # 응답 대기 (안전한 디코딩)
-            time.sleep(0.2)
-            while ser.in_waiting > 0:
-                try:
-                    raw_data = ser.readline()
-                    # UTF-8 디코딩 시도
-                    try:
-                        response = raw_data.decode('utf-8', errors='ignore').strip()
-                    except UnicodeDecodeError:
-                        # UTF-8 실패 시 Latin-1로 시도
-                        response = raw_data.decode('latin-1', errors='ignore').strip()
-
-                    if response and len(response) > 0:
-                        # 비 ASCII 문자 제거
-                        clean_response = ''.join(char for char in response if ord(char) < 128)
-                        if clean_response:
-                            print_colored(f"    → Arduino 응답: {clean_response}", Colors.GREEN)
-                except Exception:
-                    pass  # 응답 수신 실패는 무시
-
-            print_colored(f"  ✓ 명령 전송 완료", Colors.GREEN)
-
-    except serial.SerialException as e:
-        print_colored(f"  ❌ Arduino 연결 실패: {e}", Colors.FAIL)
-        print_colored(f"    확인사항: /dev/arduino 장치가 연결되어 있는지 확인하세요", Colors.WARNING)
-    except ImportError:
+    """Arduino에 NeoPixel 제어 명령 전송 (ArduinoTerminal 사용)"""
+    if not SERIAL_AVAILABLE:
         print_colored(f"  ❌ pyserial 모듈이 설치되지 않음: pip install pyserial", Colors.FAIL)
-    except Exception as e:
-        print_colored(f"  ❌ Arduino 통신 실패: {e}", Colors.FAIL)
+        return False
+
+    arduino = get_arduino_terminal()
+
+    # 연결되지 않은 경우 재연결 시도
+    if not arduino.ser or not arduino.ser.is_open:
+        print_colored(f"  🔄 Arduino 재연결 시도...", Colors.WARNING)
+        if not arduino.connect():
+            return False
+
+    print_colored(f"  💡 Arduino 조명 제어: {cmd}", Colors.CYAN)
+    return arduino.send_command(cmd)
 
 def start_hand_following():
     """손 추적 모드 시작"""
@@ -621,10 +846,85 @@ def reset_arm_position():
     except Exception as e:
         print_colored(f"  ❌ 초기화 실패: {e}", Colors.FAIL)
 
+def reconnect_arduino():
+    """Arduino 재연결"""
+    try:
+        print_colored("  🔄 Arduino 재연결 시도", Colors.CYAN)
+        arduino = get_arduino_terminal()
+
+        # 기존 연결 해제
+        if arduino.ser and arduino.ser.is_open:
+            arduino.disconnect()
+
+        # 재연결 시도
+        if arduino.connect():
+            print_colored("  ✓ Arduino 재연결 성공", Colors.GREEN)
+        else:
+            print_colored("  ❌ Arduino 재연결 실패", Colors.FAIL)
+
+    except Exception as e:
+        print_colored(f"  ❌ 재연결 오류: {e}", Colors.FAIL)
+
+def check_arduino_status():
+    """Arduino 상태 확인"""
+    try:
+        print_colored("  📊 Arduino 상태 확인", Colors.CYAN)
+        arduino = get_arduino_terminal()
+
+        if arduino.ser and arduino.ser.is_open:
+            print_colored("  ✓ Arduino 연결 상태: 정상", Colors.GREEN)
+            # 상태 명령 전송
+            arduino.send_command("STATUS")
+        else:
+            print_colored("  ❌ Arduino 연결 상태: 끊어짐", Colors.FAIL)
+            print_colored("  💡 '아두이노연결' 명령으로 재연결 가능", Colors.CYAN)
+
+    except Exception as e:
+        print_colored(f"  ❌ 상태 확인 오류: {e}", Colors.FAIL)
+
+def switch_to_wake_word_mode():
+    """웨이크워드 모드로 전환"""
+    try:
+        print_colored("  🔄 웨이크워드 모드로 전환", Colors.CYAN)
+        config.continuous_mode = False
+        print_colored("  ✓ 웨이크워드 모드 활성화 - '하이봇'을 말하고 명령하세요", Colors.GREEN)
+    except Exception as e:
+        print_colored(f"  ❌ 모드 전환 오류: {e}", Colors.FAIL)
+
+def switch_to_continuous_mode():
+    """연속 모드로 전환"""
+    try:
+        print_colored("  🔄 연속 모드로 전환", Colors.CYAN)
+        config.continuous_mode = True
+        print_colored("  ✓ 연속 모드 활성화 - 언제든지 명령어를 말씀하세요", Colors.GREEN)
+    except Exception as e:
+        print_colored(f"  ❌ 모드 전환 오류: {e}", Colors.FAIL)
+
 def main():
-    engine = VoiceRecognitionEngine()
-    engine.set_command_callback(robot_command_callback)
-    engine.run()
+    print_colored("🤖 통합 음성 제어 시스템 시작", Colors.HEADER + Colors.BOLD)
+    print_colored("=" * 50, Colors.HEADER)
+
+    # Arduino 초기 연결
+    if SERIAL_AVAILABLE:
+        arduino = get_arduino_terminal()
+        if arduino.ser and arduino.ser.is_open:
+            print_colored("✓ Arduino 준비 완료", Colors.GREEN)
+        else:
+            print_colored("⚠️ Arduino 연결 실패 - 음성 명령으로 재연결 시도 가능", Colors.WARNING)
+    else:
+        print_colored("⚠️ Arduino 제어 비활성화 (pyserial 모듈 없음)", Colors.WARNING)
+
+    print_colored("=" * 50, Colors.HEADER)
+
+    try:
+        engine = VoiceRecognitionEngine()
+        engine.set_command_callback(robot_command_callback)
+        engine.run()
+    finally:
+        # 정리
+        if _global_arduino:
+            _global_arduino.disconnect()
+        print_colored("👋 시스템 종료", Colors.GREEN)
 
 if __name__ == "__main__":
     main()
