@@ -29,7 +29,11 @@ const unsigned long STATUS_INTERVAL = 1000;     // 1초마다 상태 출력
 // LED 효과 변수
 bool ledEffectActive = false;
 unsigned long ledEffectStart = 0;
-int effectType = 0; // 0: 없음, 1: 깜빡임, 2: 페이드, 3: 무지개
+int effectType = 0; // 0: 없음, 1: 깜빡임, 2: 페이드, 3: 무지개, 4: 전체 빨간색, 5: 전체 파란색, 6: 전체 녹색, 7: 전체 노란색
+
+// 색상 변수
+int currentR = 255, currentG = 255, currentB = 255; // 현재 색상 (RGB)
+bool isLightOn = true; // 조명 상태
 
 // Neopixel 설정
 Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_RGBW + NEO_KHZ800);
@@ -77,9 +81,9 @@ void robotButtonInterrupt() {
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("=== Robot Control Arduino Module Started ===");
-  Serial.println("Version: 1.0");
-  Serial.println("Compatible with Python Robot Control System");
+  Serial.println("=== Arduino NeoPixel Controller Started ===");
+  Serial.println("Version: 2.0");
+  Serial.println("Voice Command Ready");
 
   pinMode(LED_BUTTON_PIN, INPUT_PULLUP);
   pinMode(ROBOT_BUTTON_PIN, INPUT_PULLUP);
@@ -91,8 +95,8 @@ void setup() {
   pixels.clear();
   pixels.show();
 
-  // 시작 시 LED 효과
-  startupEffect();
+  // 시작 시 LED 효과 제거 (바로 꺼진 상태로 시작)
+  // startupEffect();
 
   runner.init();
   runner.addTask(tDisplayStatus);
@@ -109,7 +113,7 @@ void setup() {
 
   // 초기 상태 전송
   sendStatus();
-  Serial.println("Arduino Ready - Waiting for Python system connection...");
+  Serial.println("Arduino Ready - Voice Commands Enabled");
 }
 
 void startupEffect() {
@@ -127,17 +131,17 @@ void startupEffect() {
 
 void displayStatusTask() {
   if (millis() - lastStatusSend > STATUS_INTERVAL) {
-    Serial.print("Status - Brightness: ");
+    Serial.print("INFO: B");
     Serial.print(brightnessLevel);
     Serial.print("/");
     Serial.print(BRIGHTNESS_STEPS);
     Serial.print(" (");
     Serial.print(currentBrightness);
-    Serial.print("), Robot Mode: ");
+    Serial.print(") M");
     Serial.print(robotMode);
-    Serial.print(", Connected: ");
-    Serial.print(systemConnected ? "YES" : "NO");
-    Serial.print(", Effect: ");
+    Serial.print(" C");
+    Serial.print(systemConnected ? "1" : "0");
+    Serial.print(" E");
     Serial.println(effectType);
     lastStatusSend = millis();
   }
@@ -150,9 +154,9 @@ void processButtonsTask() {
     currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
     ledButtonPressed = false;
 
-    Serial.print("LED Button Pressed! Brightness Level: ");
+    Serial.print("BTN: LED Level ");
     Serial.print(brightnessLevel);
-    Serial.print(" -> Brightness: ");
+    Serial.print(" Brightness ");
     Serial.println(currentBrightness);
     
     // LED 밝기 명령 전송 (Python 시스템이 필요하다면)
@@ -169,7 +173,7 @@ void processButtonsTask() {
     robotMode = !robotMode;  // 0과 1 사이 토글
     robotButtonPressed = false;
     
-    Serial.print("Robot Button Pressed! Mode changed to: ");
+    Serial.print("BTN: Robot Mode ");
     Serial.println(robotMode);
     
     // 로봇 제어 명령 전송 (Python 시스템에서 수신)
@@ -195,11 +199,81 @@ void processSerialTask() {
     else if (command.startsWith("STATUS")) {
       sendStatus();
     }
+    // 음성 명령 처리 (짧은 명령어)
+    else if (command == "ON" || command == "LIGHT_ON") {
+      isLightOn = true;
+      brightnessLevel = (brightnessLevel == 0) ? 3 : brightnessLevel;
+      currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
+      Serial.println("OK: Light ON");
+      triggerLedEffect(1);
+    }
+    else if (command == "OFF" || command == "LIGHT_OFF") {
+      isLightOn = false;
+      Serial.println("OK: Light OFF");
+      triggerLedEffect(1);
+    }
+    else if (command == "UP" || command == "BRIGHTNESS_UP") {
+      if (brightnessLevel < BRIGHTNESS_STEPS) {
+        brightnessLevel++;
+        currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
+        isLightOn = true;
+        Serial.print("OK: Brightness UP to ");
+        Serial.println(brightnessLevel);
+        triggerLedEffect(1);
+      }
+    }
+    else if (command == "DOWN" || command == "BRIGHTNESS_DOWN") {
+      if (brightnessLevel > 0) {
+        brightnessLevel--;
+        currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
+        if (brightnessLevel == 0) isLightOn = false;
+        Serial.print("OK: Brightness DOWN to ");
+        Serial.println(brightnessLevel);
+        triggerLedEffect(1);
+      }
+    }
+    else if (command == "R" || command == "RED" || command == "COLOR_RED") {
+      currentR = 255; currentG = 0; currentB = 0;
+      isLightOn = true;
+      Serial.println("OK: Color RED");
+      triggerLedEffect(4);
+    }
+    else if (command == "G" || command == "GREEN" || command == "COLOR_GREEN") {
+      currentR = 0; currentG = 255; currentB = 0;
+      isLightOn = true;
+      Serial.println("OK: Color GREEN");
+      triggerLedEffect(6);
+    }
+    else if (command == "B" || command == "BLUE" || command == "COLOR_BLUE") {
+      currentR = 0; currentG = 0; currentB = 255;
+      isLightOn = true;
+      Serial.println("OK: Color BLUE");
+      triggerLedEffect(5);
+    }
+    else if (command == "Y" || command == "YELLOW" || command == "COLOR_YELLOW") {
+      currentR = 255; currentG = 255; currentB = 0;
+      isLightOn = true;
+      Serial.println("OK: Color YELLOW");
+      triggerLedEffect(7);
+    }
+    else if (command == "W" || command == "WHITE" || command == "COLOR_WHITE") {
+      currentR = 255; currentG = 255; currentB = 255;
+      isLightOn = true;
+      Serial.println("OK: Color WHITE");
+      triggerLedEffect(1);
+    }
+    else if (command == "RAINBOW" || command == "COLOR_RAINBOW") {
+      isLightOn = true;
+      Serial.println("OK: Rainbow Effect");
+      triggerLedEffect(3);
+    }
+    // 기존 명령들
     else if (command.startsWith("SET_BRIGHTNESS:")) {
       int newLevel = command.substring(15).toInt();
       if (newLevel >= 0 && newLevel <= BRIGHTNESS_STEPS) {
         brightnessLevel = newLevel;
         currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
+        isLightOn = (newLevel > 0);
         Serial.print("Brightness set to level: ");
         Serial.println(brightnessLevel);
         triggerLedEffect(1);
@@ -228,7 +302,7 @@ void processSerialTask() {
       sendStatus();
     }
     else {
-      Serial.print("Unknown command: ");
+      Serial.print("ERR: Unknown command: ");
       Serial.println(command);
     }
   }
@@ -236,7 +310,7 @@ void processSerialTask() {
   // 연결 상태 확인 (5초 이상 heartbeat 없으면 연결 끊김으로 판단)
   if (systemConnected && (millis() - lastHeartbeat > HEARTBEAT_INTERVAL * 2)) {
     systemConnected = false;
-    Serial.println("Warning: Python system connection lost");
+    Serial.println("WARN: Connection timeout");
   }
 }
 
@@ -251,7 +325,15 @@ void sendStatus() {
   Serial.print(":MODE:");
   Serial.print(robotMode);
   Serial.print(":CONNECTED:");
-  Serial.println(systemConnected ? "1" : "0");
+  Serial.print(systemConnected ? "1" : "0");
+  Serial.print(":LIGHT:");
+  Serial.print(isLightOn ? "1" : "0");
+  Serial.print(":COLOR:");
+  Serial.print(currentR);
+  Serial.print(",");
+  Serial.print(currentG);
+  Serial.print(",");
+  Serial.println(currentB);
 }
 
 void triggerLedEffect(int type) {
@@ -263,17 +345,20 @@ void triggerLedEffect(int type) {
 void updateNeopixelTask() {
   if (ledEffectActive) {
     unsigned long elapsed = millis() - ledEffectStart;
-    
+
     switch(effectType) {
       case 1: // 깜빡임 효과 (밝기 변경 시)
-        if (elapsed < 100) {
-          int flashBrightness = (elapsed % 100 < 50) ? currentBrightness : 0;
-          setAllPixels(flashBrightness, flashBrightness, flashBrightness);
+        if (elapsed < 300) {
+          int flashBrightness = (elapsed % 200 < 100) ? currentBrightness : 0;
+          int r = (currentR * flashBrightness) / 255;
+          int g = (currentG * flashBrightness) / 255;
+          int b = (currentB * flashBrightness) / 255;
+          setAllPixels(r, g, b);
         } else {
           ledEffectActive = false;
         }
         break;
-        
+
       case 2: // 파란색 페이드 (모드 0)
         if (elapsed < 1000) {
           int intensity = (sin((elapsed / 1000.0) * PI * 2) + 1) * currentBrightness / 2;
@@ -282,38 +367,68 @@ void updateNeopixelTask() {
           ledEffectActive = false;
         }
         break;
-        
-      case 3: // 초록색 페이드 (모드 1)
-        if (elapsed < 1000) {
-          int intensity = (sin((elapsed / 1000.0) * PI * 2) + 1) * currentBrightness / 2;
-          setAllPixels(0, intensity, 0);
+
+      case 3: // 무지개 효과
+        if (elapsed < 3000) {
+          for(int i = 0; i < NUM_PIXELS; i++) {
+            int hue = (i * 256 / NUM_PIXELS + (elapsed / 10)) % 256;
+            uint32_t color = Wheel(hue);
+            // 밝기 조절
+            int r = ((color >> 16) & 0xFF) * currentBrightness / 255;
+            int g = ((color >> 8) & 0xFF) * currentBrightness / 255;
+            int b = (color & 0xFF) * currentBrightness / 255;
+            pixels.setPixelColor(i, pixels.Color(g, r, b));
+          }
         } else {
           ledEffectActive = false;
         }
         break;
-        
+
+      case 4: // 빨간색 효과
+      case 5: // 파란색 효과
+      case 6: // 녹색 효과
+      case 7: // 노란색 효과
+        if (elapsed < 500) {
+          // 색상 전환 효과
+          float progress = elapsed / 500.0;
+          int r = currentR * currentBrightness / 255 * progress;
+          int g = currentG * currentBrightness / 255 * progress;
+          int b = currentB * currentBrightness / 255 * progress;
+          setAllPixels(r, g, b);
+        } else {
+          ledEffectActive = false;
+        }
+        break;
+
       default:
         ledEffectActive = false;
         break;
     }
   } else {
-    // 일반 상태 - 흰색 LED
-    setAllPixels(currentBrightness, currentBrightness, currentBrightness);
+    // 일반 상태 - 현재 색상과 밝기로 표시
+    if (isLightOn && currentBrightness > 0) {
+      int r = (currentR * currentBrightness) / 255;
+      int g = (currentG * currentBrightness) / 255;
+      int b = (currentB * currentBrightness) / 255;
+      setAllPixels(r, g, b);
+    } else {
+      setAllPixels(0, 0, 0); // 조명 꺼짐
+    }
   }
-  
-  // 연결 상태 표시 (첫 번째 LED)
-  if (!systemConnected && NUM_PIXELS > 0) {
-    // 연결 안됨 - 빨간색 깜빡임
-    int redIntensity = (millis() % 1000 < 500) ? 50 : 0;
-    pixels.setPixelColor(0, pixels.Color(redIntensity, 0, 0));
-  }
-  
+
+  // 연결 상태 표시 제거 (깜빡임 없음)
+  // if (!systemConnected && NUM_PIXELS > 0) {
+  //   // 연결 안됨 - 빨간색 깜빡임
+  //   int redIntensity = (millis() % 1000 < 500) ? 50 : 0;
+  //   pixels.setPixelColor(0, pixels.Color(redIntensity, 0, 0));
+  // }
+
   pixels.show();
 }
 
 void setAllPixels(int r, int g, int b) {
   for (int i = 0; i < NUM_PIXELS; i++) {
-    pixels.setPixelColor(i, pixels.Color(r, g, b));
+    pixels.setPixelColor(i, pixels.Color(g, r, b));
   }
 }
 
