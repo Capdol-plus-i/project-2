@@ -17,8 +17,10 @@ import audioop
 import json
 import threading
 import queue
+import signal
+import weakref
 from dataclasses import dataclass
-
+from contextlib import contextmanager
 from typing import Optional, Dict, List
 
 import pyaudio
@@ -186,10 +188,30 @@ class VoiceConfig:
 # 전역 설정
 config = VoiceConfig()
 
-# 계산된 상수들
+# 계산된 상수들 (성능 최적화)
 SAMPLES_PER_FRAME = int(config.rate * config.frame_ms / 1000)
 BYTES_PER_SAMPLE = 2
 FRAME_BYTES = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE
+
+# 전역 캐시 변수들
+_normalized_wake_words = None
+_normalized_commands = None
+
+def get_normalized_wake_words():
+    """normalize된 웨이크워드 캐시"""
+    global _normalized_wake_words
+    if _normalized_wake_words is None:
+        _normalized_wake_words = [normalize(w) for w in config.wake_words]
+    return _normalized_wake_words
+
+def get_normalized_commands():
+    """normalize된 명령어 맵 캐시"""
+    global _normalized_commands
+    if _normalized_commands is None:
+        _normalized_commands = {}
+        for cmd, variations in config.command_map.items():
+            _normalized_commands[cmd] = [normalize(v) for v in variations]
+    return _normalized_commands
 
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text or "")
@@ -227,7 +249,7 @@ class ImprovedMicrophoneStream:
         self._frame_ms = frame_ms
         self._target_bytes_per_frame = int(target_rate * frame_ms / 1000) * BYTES_PER_SAMPLE
 
-        self._buff = queue.Queue()
+        self._buff = queue.Queue(maxsize=100)  # 큐 크기 제한으로 메모리 사용량 제어
         self._carry = b""
         self._ratecv_state = None
         self.vad = webrtcvad.Vad(config.vad_aggressiveness)
@@ -236,6 +258,9 @@ class ImprovedMicrophoneStream:
         self._hw_rate = None
         self.closed = True
         self._error_count = 0
+        self._cleanup_lock = threading.Lock()  # 정리 작업 동기화
+        self._pa = None
+        self._stream = None
 
     def __enter__(self):
         self._pa = pyaudio.PyAudio()
@@ -278,27 +303,67 @@ class ImprovedMicrophoneStream:
         return self
 
     def __exit__(self, exc_type, value, traceback):
-        try:
-            if hasattr(self, '_stream'):
-                self._stream.stop_stream()
-                self._stream.close()
-        except:
-            pass
-        finally:
+        with self._cleanup_lock:
+            if self.closed:
+                return
+
             self.closed = True
-            self._buff.put(None)
-            if hasattr(self, '_pa'):
-                self._pa.terminate()
+
+            # 스트림 정리
+            if self._stream:
+                try:
+                    if not self._stream.is_stopped():
+                        self._stream.stop_stream()
+                except:
+                    pass
+                try:
+                    self._stream.close()
+                except:
+                    pass
+                self._stream = None
+
+            # PyAudio 정리
+            if self._pa:
+                try:
+                    self._pa.terminate()
+                except:
+                    pass
+                self._pa = None
+
+            # 큐 정리 - 논블로킹으로 비우기
+            try:
+                while not self._buff.empty():
+                    try:
+                        self._buff.get_nowait()
+                    except queue.Empty:
+                        break
+                self._buff.put(None)  # 종료 신호
+            except:
+                pass
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        if self.closed:
+            return (None, pyaudio.paComplete)
+
         if status_flags:
             self._error_count += 1
             if self._error_count > 10:
                 print_colored("⚠️ 마이크 오류가 너무 많습니다", Colors.WARNING)
+                return (None, pyaudio.paComplete)
         else:
             self._error_count = 0
 
-        self._buff.put(in_data)
+        try:
+            # 큐가 가득 찬 경우 오래된 데이터 제거
+            if self._buff.full():
+                try:
+                    self._buff.get_nowait()
+                except queue.Empty:
+                    pass
+            self._buff.put(in_data, block=False)
+        except queue.Full:
+            pass  # 큐가 가득 차면 프레임 건너뛰기
+
         return (None, pyaudio.paContinue)
 
     def _to_target_rate(self, data: bytes) -> bytes:
@@ -318,26 +383,34 @@ class ImprovedMicrophoneStream:
     def generator(self):
         try:
             while not self.closed:
-                chunk = self._buff.get()
-                if chunk is None:
-                    return
+                try:
+                    chunk = self._buff.get(timeout=1.0)  # 타임아웃 추가
+                    if chunk is None or self.closed:
+                        return
 
-                pcm16k = self._to_target_rate(chunk)
-                self._carry += pcm16k
+                    pcm16k = self._to_target_rate(chunk)
+                    self._carry += pcm16k
 
-                while len(self._carry) >= self._target_bytes_per_frame:
-                    frame = self._carry[:self._target_bytes_per_frame]
-                    self._carry = self._carry[self._target_bytes_per_frame:]
+                    while len(self._carry) >= self._target_bytes_per_frame:
+                        frame = self._carry[:self._target_bytes_per_frame]
+                        self._carry = self._carry[self._target_bytes_per_frame:]
 
-                    try:
-                        if self.vad.is_speech(frame, config.rate):
-                            yield frame
-                    except Exception:
-                        # VAD 에러 시 프레임 건너뛰기
-                        continue
+                        try:
+                            if self.vad.is_speech(frame, config.rate):
+                                yield frame
+                        except Exception:
+                            continue
+
+                except queue.Empty:
+                    continue  # 타임아웃 시 계속 시도
+                except Exception:
+                    break
 
         except GeneratorExit:
             return
+        finally:
+            # 정리 작업
+            self._carry = b""
 
 class VoiceRecognitionEngine:
     """개선된 음성 인식 엔진"""
@@ -347,6 +420,10 @@ class VoiceRecognitionEngine:
         self.command_callback = None
         self.arduino_terminal = ArduinoTerminal()
         self.arduino_connected = False
+        self._active_streams = weakref.WeakSet()
+        self._shutdown_event = threading.Event()
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
     def set_command_callback(self, callback):
         """명령 실행 콜백 설정"""
@@ -377,14 +454,43 @@ class VoiceRecognitionEngine:
         )
         return client, streaming_config
 
+    def _signal_handler(self, signum, frame):
+        """시그널 핸들러 - 깨끗한 종료"""
+        print_colored("\n🛝 종료 신호 수신, 시스템 종료 중...", Colors.WARNING)
+        self._shutdown_event.set()
+        self.is_listening = False
+
+    @contextmanager
+    def _managed_stream(self, is_command_mode=False, device_index=None):
+        """스트림 자원 관리"""
+        mic = None
+        try:
+            client, streaming_config = self.build_client_and_config(is_command_mode=is_command_mode)
+            mic = ImprovedMicrophoneStream(config.rate, config.frame_ms, device_index=device_index)
+            mic.__enter__()
+            self._active_streams.add(mic)
+
+            audio_generator = mic.generator()
+            requests = (speech.StreamingRecognizeRequest(audio_content=frame) for frame in audio_generator)
+            responses = client.streaming_recognize(streaming_config, requests)
+
+            yield mic, responses
+
+        finally:
+            if mic:
+                try:
+                    mic.__exit__(None, None, None)
+                except:
+                    pass
+                try:
+                    self._active_streams.discard(mic)
+                except:
+                    pass
+
     def start_stream(self, is_command_mode=False, device_index=None):
-        client, streaming_config = self.build_client_and_config(is_command_mode=is_command_mode)
-        mic = ImprovedMicrophoneStream(config.rate, config.frame_ms, device_index=device_index)
-        mic.__enter__()
-        audio_generator = mic.generator()
-        requests = (speech.StreamingRecognizeRequest(audio_content=frame) for frame in audio_generator)
-        responses = client.streaming_recognize(streaming_config, requests)
-        return mic, responses
+        """기존 호환성을 위한 래퍼"""
+        with self._managed_stream(is_command_mode, device_index) as (mic, responses):
+            return mic, responses
 
     def execute_command(self, command: str):
         """명령 실행"""
@@ -576,8 +682,27 @@ class VoiceRecognitionEngine:
         except Exception as e:
             print_colored(f"시스템 오류: {e}", Colors.FAIL)
         finally:
-            self.is_listening = False
+            self._cleanup_resources()
             print_colored("🛑 음성 인식 시스템 종료", Colors.GREEN)
+
+    def _cleanup_resources(self):
+        """리소스 정리"""
+        self.is_listening = False
+        self._shutdown_event.set()
+
+        # 모든 액티브 스트림 정리
+        for stream in list(self._active_streams):
+            try:
+                stream.__exit__(None, None, None)
+            except:
+                pass
+
+        # Arduino 연결 정리
+        if self.arduino_terminal:
+            try:
+                self.arduino_terminal.disconnect()
+            except:
+                pass
 
     def _handle_session_mode(self):
         """세션 모드 처리 - 웨이크워드 후 연속 명령"""
@@ -685,9 +810,10 @@ class VoiceRecognitionEngine:
                         # 명령어 매칭 (final 결과에서만)
                         if cmd_result.is_final:
                             command = None
-                            command_map = config.command_map or {}
-                            for cmd, variations in command_map.items():
-                                if any(normalize(v) in cmd_transcript for v in variations):
+                            # 성능 최적화된 명령어 매칭
+                            normalized_commands = get_normalized_commands()
+                            for cmd, normalized_variations in normalized_commands.items():
+                                if any(v in cmd_transcript for v in normalized_variations):
                                     command = cmd
                                     break
 
@@ -740,51 +866,61 @@ class VoiceRecognitionEngine:
 
         print_colored("🔚 연속 모드 종료", Colors.GREEN)
 
-# NeoPixel + 로봇팔 제어 콜백
+# ===== 명령 처리 섹션 =====
+
+class CommandProcessor:
+    """명령 처리 클래스 - 코드 구조 개선"""
+
+    def __init__(self):
+        self.light_commands = {
+            "조명켜": "ON",
+            "조명꺼": "OFF",
+            "밝게": "UP",
+            "어둡게": "DOWN",
+            "빨간색": "R",
+            "파란색": "B",
+            "녹색": "G",
+            "노란색": "Y",
+            "하얀색": "W",
+            "무지개": "RAINBOW",
+        }
+
+        self.follow_commands = {
+            "팔로우시작": start_hand_following,
+            "팔로우정지": stop_hand_following,
+            "초기화": reset_arm_position,
+        }
+
+        self.system_commands = {
+            "아두이노연결": reconnect_arduino,
+            "상태확인": check_arduino_status,
+            "웨이크워드모드": switch_to_wake_word_mode,
+            "연속모드": switch_to_continuous_mode,
+        }
+
+    def execute(self, command: str):
+        """명령 실행"""
+        if command in self.light_commands:
+            print_colored(f"💡 조명 제어: {command}", Colors.CYAN)
+            return send_arduino_command(self.light_commands[command])
+        elif command in self.follow_commands:
+            print_colored(f"🦾 로봇팔 제어: {command}", Colors.GREEN)
+            self.follow_commands[command]()
+            return True
+        elif command in self.system_commands:
+            print_colored(f"⚙️ 시스템 제어: {command}", Colors.BLUE)
+            self.system_commands[command]()
+            return True
+        else:
+            print_colored(f"❓ 알 수 없는 명령: {command}", Colors.WARNING)
+            return False
+
+# 전역 명령 처리기 인스턴스
+_command_processor = CommandProcessor()
+
 def robot_command_callback(command: str):
     """NeoPixel 조명 + 로봇팔 팔로우 명령 실행"""
-
-    # 조명 제어 명령 (짧은 명령어)
-    light_commands = {
-        "조명켜": lambda: send_arduino_command("ON"),
-        "조명꺼": lambda: send_arduino_command("OFF"),
-        "밝게": lambda: send_arduino_command("UP"),
-        "어둡게": lambda: send_arduino_command("DOWN"),
-
-        "빨간색": lambda: send_arduino_command("R"),
-        "파란색": lambda: send_arduino_command("B"),
-        "녹색": lambda: send_arduino_command("G"),
-        "노란색": lambda: send_arduino_command("Y"),
-        "하얀색": lambda: send_arduino_command("W"),
-        "무지개": lambda: send_arduino_command("RAINBOW"),
-    }
-
-    # 팔로우 제어 명령
-    follow_commands = {
-        "팔로우시작": lambda: start_hand_following(),
-        "팔로우정지": lambda: stop_hand_following(),
-        "초기화": lambda: reset_arm_position(),
-    }
-
-    # 시스템 제어 명령
-    system_commands = {
-        "아두이노연결": lambda: reconnect_arduino(),
-        "상태확인": lambda: check_arduino_status(),
-        "웨이크워드모드": lambda: switch_to_wake_word_mode(),
-        "연속모드": lambda: switch_to_continuous_mode(),
-    }
-
-    if command in light_commands:
-        print_colored(f"💡 조명 제어: {command}", Colors.CYAN)
-        light_commands[command]()
-    elif command in follow_commands:
-        print_colored(f"🦾 로봇팔 제어: {command}", Colors.GREEN)
-        follow_commands[command]()
-    elif command in system_commands:
-        print_colored(f"⚙️ 시스템 제어: {command}", Colors.BLUE)
-        system_commands[command]()
-    else:
-        print_colored(f"❓ 알 수 없는 명령: {command}", Colors.WARNING)
+    return _command_processor.execute(command)
 
 # 전역 Arduino 터미널 인스턴스
 _global_arduino = None
@@ -794,9 +930,11 @@ def get_arduino_terminal():
     global _global_arduino
     if _global_arduino is None:
         _global_arduino = ArduinoTerminal()
-        # 초기 연결 시도
         if SERIAL_AVAILABLE:
-            _global_arduino.connect()
+            try:
+                _global_arduino.connect()
+            except Exception as e:
+                print_colored(f"⚠️ Arduino 초기 연결 실패: {e}", Colors.WARNING)
     return _global_arduino
 
 def send_arduino_command(cmd: str):
@@ -805,16 +943,22 @@ def send_arduino_command(cmd: str):
         print_colored(f"  ❌ pyserial 모듈이 설치되지 않음: pip install pyserial", Colors.FAIL)
         return False
 
-    arduino = get_arduino_terminal()
+    try:
+        arduino = get_arduino_terminal()
 
-    # 연결되지 않은 경우 재연결 시도
-    if not arduino.ser or not arduino.ser.is_open:
-        print_colored(f"  🔄 Arduino 재연결 시도...", Colors.WARNING)
-        if not arduino.connect():
-            return False
+        # 연결 상태 확인 및 재연결
+        if not arduino.ser or not arduino.ser.is_open:
+            print_colored(f"  🔄 Arduino 재연결 시도...", Colors.WARNING)
+            if not arduino.connect():
+                print_colored(f"  ❌ Arduino 연결 실패", Colors.FAIL)
+                return False
 
-    print_colored(f"  💡 Arduino 조명 제어: {cmd}", Colors.CYAN)
-    return arduino.send_command(cmd)
+        print_colored(f"  💡 Arduino 조명 제어: {cmd}", Colors.CYAN)
+        return arduino.send_command(cmd)
+
+    except Exception as e:
+        print_colored(f"  ❌ Arduino 명령 전송 오류: {e}", Colors.FAIL)
+        return False
 
 def start_hand_following():
     """손 추적 모드 시작"""

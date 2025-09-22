@@ -864,6 +864,11 @@ class UnifiedLogger:
             print("⚠️  Follower arm not available for torque disable")
 
 def main():
+    # Set DISPLAY environment variable for OpenCV GUI
+    import os
+    if not os.environ.get('DISPLAY'):
+        os.environ['DISPLAY'] = ':0'
+
     parser = argparse.ArgumentParser(description="Unified Hand Tracking and Robot Arm Logger")
     parser.add_argument("--mode", choices=['continuous', 'snapshot'], default='continuous',
                        help="Recording mode: continuous or snapshot")
