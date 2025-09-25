@@ -164,7 +164,6 @@ void processButtonsTask() {
     Serial.println(brightnessLevel);
     
     // LED 효과 트리거
-    triggerLedEffect(1); // 깜빡임 효과
     sendStatus();
   }
   
@@ -205,12 +204,10 @@ void processSerialTask() {
       brightnessLevel = (brightnessLevel == 0) ? 3 : brightnessLevel;
       currentBrightness = brightnessLevel * (MAX_BRIGHTNESS / BRIGHTNESS_STEPS);
       Serial.println("OK: Light ON");
-      triggerLedEffect(1);
     }
     else if (command == "OFF" || command == "LIGHT_OFF") {
       isLightOn = false;
       Serial.println("OK: Light OFF");
-      triggerLedEffect(1);
     }
     else if (command == "UP" || command == "BRIGHTNESS_UP") {
       if (brightnessLevel < BRIGHTNESS_STEPS) {
@@ -219,7 +216,6 @@ void processSerialTask() {
         isLightOn = true;
         Serial.print("OK: Brightness UP to ");
         Serial.println(brightnessLevel);
-        triggerLedEffect(1);
       }
     }
     else if (command == "DOWN" || command == "BRIGHTNESS_DOWN") {
@@ -229,7 +225,6 @@ void processSerialTask() {
         if (brightnessLevel == 0) isLightOn = false;
         Serial.print("OK: Brightness DOWN to ");
         Serial.println(brightnessLevel);
-        triggerLedEffect(1);
       }
     }
     else if (command == "R" || command == "RED" || command == "COLOR_RED") {
@@ -260,7 +255,6 @@ void processSerialTask() {
       currentR = 255; currentG = 255; currentB = 255;
       isLightOn = true;
       Serial.println("OK: Color WHITE");
-      triggerLedEffect(1);
     }
     else if (command == "RAINBOW" || command == "COLOR_RAINBOW") {
       isLightOn = true;

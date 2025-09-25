@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""
+Simple Feedforward Model for Camera to Joint Mapping
+Maps 4 camera coordinates (2 cameras × 2 coordinates) to 4 robot joint positions
+"""
+
+import argparse
+from datetime import datetime
+from typing import Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
+
+class CameraJointDataset(Dataset):
+    """Dataset for camera coordinates to joint positions"""
+
+    def __init__(self, features, targets):
+        self.features = torch.FloatTensor(features)
+        self.targets = torch.FloatTensor(targets)
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.targets[idx]
+
+
+class SimpleFeedforward(nn.Module):
+    """Configurable feedforward regression network."""
+
+    def __init__(
+        self,
+        input_dim: int = 4,
+        output_dim: int = 4,
+        d_model: int = 8,
+        nhead: int = 1,
+        num_layers: int = 1,
+        dim_feedforward: int = 12,
+        dropout: float = 0.0,
+        hidden_sizes: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
+
+        if hidden_sizes is None:
+            if num_layers <= 0:
+                raise ValueError("num_layers must be positive when hidden_sizes is not provided")
+            hidden_sizes = tuple(dim_feedforward for _ in range(num_layers)) or (dim_feedforward,)
+
+        hidden_sizes_tuple = tuple(hidden_sizes)
+        if not hidden_sizes_tuple:
+            raise ValueError("hidden_sizes must contain at least one layer")
+
+        layers: list[nn.Module] = []
+        in_dim = input_dim
+        for hidden_dim in hidden_sizes_tuple:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, output_dim))
+        self.network = nn.Sequential(*layers)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize weights with Xavier initialization."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+class FeedforwardCameraJointRegressor:
+    """Feedforward neural network regressor for camera to joint mapping"""
+
+    def __init__(
+        self,
+        d_model: int = 8,
+        nhead: int = 1,
+        num_layers: int = 1,
+        dim_feedforward: int = 12,
+        hidden_sizes: Sequence[int] | None = (8, 16, 8),
+        dropout: float = 0.0,
+        learning_rate: float = 0.001,
+        batch_size: int = 8,
+        epochs: int = 800,
+        device: torch.device | None = None,
+    ) -> None:
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.hidden_sizes = tuple(hidden_sizes) if hidden_sizes is not None else None
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+
+        # Device setup
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+
+        print(f"🔧 Using device: {self.device}")
+
+        # Scalers
+        self.scaler_X = StandardScaler()
+        self.scaler_y = StandardScaler()
+
+        # Training history
+        self.train_losses = []
+        self.val_losses = []
+
+    def load_data(self, csv_file='unified_log_20250922_192827.csv'):
+        """Load data from CSV file"""
+        print(f"📁 Loading data from {csv_file}")
+
+        # Load CSV
+        self.raw_data = pd.read_csv(csv_file)
+        print(f"📊 Loaded {len(self.raw_data)} rows")
+
+        return self.raw_data
+
+    def preprocess_data(self):
+        """Preprocess the data for training"""
+        print("🔧 Preprocessing data...")
+
+        # Define input features (camera coordinates) and targets (joint positions)
+        feature_cols = ['cam_left_x', 'cam_left_y', 'cam_right_x', 'cam_right_y']
+        target_cols = ['follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4']
+
+        # Remove rows with any missing values
+        data_clean = self.raw_data.dropna(subset=feature_cols + target_cols)
+        print(f"📊 After removing NaN values: {len(data_clean)} rows ({len(self.raw_data) - len(data_clean)} removed)")
+
+        if len(data_clean) == 0:
+            raise ValueError("No valid data remaining after preprocessing")
+
+        # Extract features and targets
+        X = data_clean[feature_cols].values
+        y = data_clean[target_cols].values
+
+        # Check for any remaining invalid values
+        X_valid = np.isfinite(X).all(axis=1)
+        y_valid = np.isfinite(y).all(axis=1)
+        valid_mask = X_valid & y_valid
+
+        X = X[valid_mask]
+        y = y[valid_mask]
+
+        print(f"📊 Final dataset: {len(X)} samples with {X.shape[1]} features -> {y.shape[1]} targets")
+        print(f"📈 Feature ranges:")
+        for i, col in enumerate(feature_cols):
+            print(f"  {col}: {X[:, i].min():.1f} - {X[:, i].max():.1f}")
+        print(f"📈 Target ranges:")
+        for i, col in enumerate(target_cols):
+            print(f"  {col}: {y[:, i].min():.1f} - {y[:, i].max():.1f}")
+
+        self.X = X
+        self.y = y
+        self.feature_cols = feature_cols
+        self.target_cols = target_cols
+
+        return X, y
+
+    def split_data(self, test_size=0.0, random_state=42):
+        """Split data into train and test sets"""
+        if test_size == 0.0:
+            # Use all data for training
+            self.X_train = self.X
+            self.X_test = self.X  # Use same data for validation
+            self.y_train = self.y
+            self.y_test = self.y
+            print(f"📊 Using all {len(self.X)} samples for training (maximum overfitting)")
+        else:
+            self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+                self.X, self.y, test_size=test_size, random_state=random_state
+            )
+            print(f"📊 Train set: {len(self.X_train)} samples")
+            print(f"📊 Test set: {len(self.X_test)} samples")
+
+        return self.X_train, self.X_test, self.y_train, self.y_test
+
+    def train(self, normalize=True):
+        """Train the feedforward model"""
+        print("🤖 Training simplified neural network...")
+
+        if normalize:
+            # Normalize features and targets
+            X_train_scaled = self.scaler_X.fit_transform(self.X_train)
+            y_train_scaled = self.scaler_y.fit_transform(self.y_train)
+            X_val_scaled = self.scaler_X.transform(self.X_test)
+            y_val_scaled = self.scaler_y.transform(self.y_test)
+        else:
+            X_train_scaled = self.X_train
+            y_train_scaled = self.y_train
+            X_val_scaled = self.X_test
+            y_val_scaled = self.y_test
+
+        self.normalize = normalize
+
+        # Create datasets
+        train_dataset = CameraJointDataset(X_train_scaled, y_train_scaled)
+        val_dataset = CameraJointDataset(X_val_scaled, y_val_scaled)
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+
+        # Create model
+        self.model = SimpleFeedforward(
+            input_dim=4,
+            output_dim=4,
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_layers=self.num_layers,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            hidden_sizes=self.hidden_sizes
+        ).to(self.device)
+
+        print(f"🧠 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        if self.hidden_sizes is not None:
+            print(f"   Hidden sizes: {self.hidden_sizes}")
+
+        # Optimizer and loss function
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=0.0)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=50)
+        criterion = nn.MSELoss()
+
+        # Training loop
+        best_val_loss = float('inf')
+        patience = 50
+        patience_counter = 0
+
+        for epoch in range(self.epochs):
+            # Training
+            self.model.train()
+            train_loss = 0.0
+            for batch_features, batch_targets in train_loader:
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
+
+                optimizer.zero_grad()
+                predictions = self.model(batch_features)
+                loss = criterion(predictions, batch_targets)
+                loss.backward()
+
+                # Gradient clipping for stability
+                #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                train_loss += loss.item()
+
+            avg_train_loss = train_loss / len(train_loader)
+            self.train_losses.append(avg_train_loss)
+
+            # Validation
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch_features, batch_targets in val_loader:
+                    batch_features = batch_features.to(self.device)
+                    batch_targets = batch_targets.to(self.device)
+
+                    predictions = self.model(batch_features)
+                    loss = criterion(predictions, batch_targets)
+                    val_loss += loss.item()
+
+            avg_val_loss = val_loss / len(val_loader)
+            self.val_losses.append(avg_val_loss)
+
+            # Learning rate scheduling
+            scheduler.step(avg_val_loss)
+
+            # Early stopping
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save(self.model.state_dict(), 'best_feedforward_model.pth')
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+            if epoch % 100 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {current_lr:.6f}")
+
+        # Load best model
+        self.model.load_state_dict(torch.load('best_feedforward_model.pth'))
+        print("✅ Training completed")
+
+    def predict(self, X):
+        """Make predictions"""
+        self.model.eval()
+
+        if self.normalize:
+            X_scaled = self.scaler_X.transform(X)
+        else:
+            X_scaled = X
+
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+
+        with torch.no_grad():
+            predictions = self.model(X_tensor).cpu().numpy()
+
+        if self.normalize:
+            predictions = self.scaler_y.inverse_transform(predictions)
+
+        return predictions
+
+    def evaluate(self):
+        """Evaluate the model on test set"""
+        print("📊 Evaluating feedforward model performance...")
+
+        # Make predictions
+        y_pred = self.predict(self.X_test)
+
+        # Calculate metrics
+        mse = mean_squared_error(self.y_test, y_pred)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(self.y_test, y_pred)
+        r2 = r2_score(self.y_test, y_pred)
+
+        print(f"📈 Overall Performance:")
+        print(f"  RMSE: {rmse:.2f}")
+        print(f"  MAE: {mae:.2f}")
+        print(f"  R²: {r2:.4f}")
+
+        # Per-target metrics
+        print(f"📈 Per-Joint Performance:")
+        for i, target_col in enumerate(self.target_cols):
+            mse_i = mean_squared_error(self.y_test[:, i], y_pred[:, i])
+            rmse_i = np.sqrt(mse_i)
+            mae_i = mean_absolute_error(self.y_test[:, i], y_pred[:, i])
+            r2_i = r2_score(self.y_test[:, i], y_pred[:, i])
+
+            print(f"  {target_col}:")
+            print(f"    RMSE: {rmse_i:.2f}, MAE: {mae_i:.2f}, R²: {r2_i:.4f}")
+
+        self.test_metrics = {
+            'rmse': rmse, 'mae': mae, 'r2': r2,
+            'y_test': self.y_test, 'y_pred': y_pred
+        }
+
+        return self.test_metrics
+
+    def plot_results(self, save_plot=True):
+        """Plot prediction results"""
+        if not hasattr(self, 'test_metrics'):
+            print("❌ No test metrics available. Run evaluate() first.")
+            return
+
+        y_test = self.test_metrics['y_test']
+        y_pred = self.test_metrics['y_pred']
+
+        # Plot 1: Actual vs Predicted for each joint
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        axes = axes.ravel()
+
+        for i, target_col in enumerate(self.target_cols):
+            ax = axes[i]
+
+            # Scatter plot of actual vs predicted
+            ax.scatter(y_test[:, i], y_pred[:, i], alpha=0.6, s=20)
+
+            # Perfect prediction line
+            min_val = min(y_test[:, i].min(), y_pred[:, i].min())
+            max_val = max(y_test[:, i].max(), y_pred[:, i].max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+
+            ax.set_xlabel('Actual')
+            ax.set_ylabel('Predicted')
+            ax.set_title(f'{target_col} (R² = {r2_score(y_test[:, i], y_pred[:, i]):.4f})')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_plot:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            plot_filename = f"feedforward_results_{timestamp}.png"
+            plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+            print(f"📊 Plot saved: {plot_filename}")
+
+        plt.show()
+
+        # Plot 2: Training history
+        if self.train_losses and self.val_losses:
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.train_losses, label='Training Loss', alpha=0.7)
+            plt.plot(self.val_losses, label='Validation Loss', alpha=0.7)
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Feedforward Training History')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.yscale('log')
+
+            if save_plot:
+                history_filename = f"feedforward_training_history_{timestamp}.png"
+                plt.savefig(history_filename, dpi=300, bbox_inches='tight')
+                print(f"📊 Training history saved: {history_filename}")
+
+            plt.show()
+
+    def save_model(self, filename=None):
+        """Save the trained model"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"feedforward_camera_joint_{timestamp}.pth"
+
+        # Save model state and metadata
+        save_dict = {
+            'model_state_dict': self.model.state_dict(),
+            'model_config': {
+                'd_model': self.d_model,
+                'nhead': self.nhead,
+                'num_layers': self.num_layers,
+                'dim_feedforward': self.dim_feedforward,
+                'hidden_sizes': self.hidden_sizes,
+                'dropout': self.dropout
+            },
+            'scaler_X': self.scaler_X,
+            'scaler_y': self.scaler_y,
+            'feature_cols': self.feature_cols,
+            'target_cols': self.target_cols,
+            'normalize': self.normalize
+        }
+
+        torch.save(save_dict, filename)
+        print(f"💾 Feedforward model saved: {filename}")
+        return filename
+
+def main():
+    parser = argparse.ArgumentParser(description="Train feedforward network for camera to joint mapping")
+    parser.add_argument("--data", default="unified_log_20250923_204357.csv",
+                       help="CSV file to use")
+    parser.add_argument("--test-size", type=float, default=0.0,
+                       help="Test set size (default: 0.0 - use all data for training)")
+    parser.add_argument("--no-normalize", action='store_true',
+                       help="Disable feature normalization")
+    parser.add_argument("--no-plot", action='store_true',
+                       help="Skip plotting results")
+    parser.add_argument("--output", help="Output model filename")
+    parser.add_argument("--d-model", type=int, default=8,
+                       help="Hidden layer dimension")
+    parser.add_argument("--nhead", type=int, default=1,
+                       help="Number of attention heads")
+    parser.add_argument("--num-layers", type=int, default=1,
+                       help="Number of hidden layers")
+    parser.add_argument("--hidden-sizes", default="8,16,8",
+                       help="Comma-separated hidden layer sizes (overrides --num-layers)")
+    parser.add_argument("--dropout", type=float, default=0.0,
+                       help="Dropout rate applied after each hidden layer")
+    parser.add_argument("--epochs", type=int, default=3000,
+                       help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=0.001,
+                       help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=1,
+                       help="Batch size")
+
+    args = parser.parse_args()
+
+    hidden_sizes: Sequence[int] | None
+    if args.hidden_sizes:
+        try:
+            hidden_sizes = tuple(int(size.strip()) for size in args.hidden_sizes.split(',') if size.strip())
+        except ValueError as exc:
+            parser.error(f"Invalid --hidden-sizes value '{args.hidden_sizes}': {exc}")
+        if not hidden_sizes:
+            hidden_sizes = None
+    else:
+        hidden_sizes = None
+
+    resolved_num_layers = len(hidden_sizes) if hidden_sizes is not None else args.num_layers
+
+    print("🤖 Feedforward Model Training for Camera to Joint Mapping")
+    print("=" * 60)
+
+    try:
+        # Initialize regressor
+        regressor = FeedforwardCameraJointRegressor(
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=resolved_num_layers,
+            learning_rate=args.lr,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            hidden_sizes=hidden_sizes,
+            dropout=args.dropout
+        )
+
+        # Load and preprocess data
+        regressor.load_data(args.data)
+        regressor.preprocess_data()
+        regressor.split_data(test_size=args.test_size)
+
+        # Train model
+        regressor.train(normalize=not args.no_normalize)
+
+        # Evaluate model
+        regressor.evaluate()
+
+        # Plot results
+        if not args.no_plot:
+            regressor.plot_results()
+
+        # Save model
+        regressor.save_model(args.output)
+
+        print("✅ Feedforward training completed successfully!")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()

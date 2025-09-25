@@ -108,7 +108,7 @@ def create_test_pattern():
     
     return img
 
-def encode_frame_jpeg(image, quality=85):
+def encode_frame_jpeg(image, quality=70):  # 품질 낮춤으로 인코딩 속도 향상
     """이미지를 JPEG 형식으로 인코딩하고 HTTP 응답에 맞는 바이트 형식으로 반환"""
     if image is None:
         return None
@@ -157,8 +157,8 @@ class FrameProcessor(threading.Thread):
                 if frame_data:
                     self.frame_queue.put(frame_data)
                 
-                # 30fps 유지를 위한 짧은 대기
-                time.sleep(0.01)
+                # 60fps 유지를 위한 더 짧은 대기
+                time.sleep(0.008)  # ~60 FPS
             except Exception as e:
                 logger.error(f"Frame processing error: {e}")
                 time.sleep(0.1)
@@ -176,7 +176,7 @@ class FrameProcessor(threading.Thread):
             return None
 
 class CameraProcessor:
-    def __init__(self, camera_id=8, width=640, height=480):  # 해상도 320x240으로 낮춤
+    def __init__(self, camera_id=8, width=320, height=240):  # 해상도를 낮춰서 FPS 향상
         self.camera_id = camera_id
         self.width = width
         self.height = height
@@ -187,12 +187,12 @@ class CameraProcessor:
         self.hand_controller = None
         self.control_mode = "none"
         
-        # MediaPipe Hands 초기화
+        # MediaPipe Hands 초기화 - 고속 처리 최적화
         self.hands = mp_hands.Hands(
-            model_complexity=0,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.3,  # 낮게 설정하여 추적 최적화
-            max_num_hands=1)  # 한 손만 감지하도록 제한
+            model_complexity=0,  # 가장 빠른 모델
+            min_detection_confidence=0.3,  # 더 낮춘 임계값
+            min_tracking_confidence=0.2,  # 더 낮춘 추적 임계값
+            max_num_hands=1)  # 한 손만 감지
             
     def start_processing(self):
         """별도 스레드에서 프레임 처리 시작"""
@@ -226,16 +226,21 @@ class CameraProcessor:
             
         logger.info(f"Connected to camera ID: {self.camera_id}")
         
-        # 카메라 매개변수 설정
+        # 카메라 매개변수 설정 - 고속 최적화
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        # 카메라 포맷 설정 (MJPG가 더 빠를 수 있음)
+        self.cap.set(cv2.CAP_PROP_FPS, 60)  # 60 FPS로 설정
+
+        # 카메라 포맷 설정 (MJPG가 더 빠름)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        
+
         # 버퍼 크기 줄여서 지연 시간 최소화
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # 추가 성능 최적화 설정
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # 낮은 노출로 빠른 캡처
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 수동 노출
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # 자동 포커스 비활성화
         
         # 테스트 프레임으로 카메라 작동 확인
         for _ in range(5):  # 여러 번 시도
@@ -257,7 +262,7 @@ class CameraProcessor:
             # 프레임 카운터 추가
             cv2.putText(image, f"Frame: {self.frame_count}", (20, 455), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            time.sleep(0.033)  # ~30 FPS
+            time.sleep(0.016)  # ~60 FPS
             return image
             
         # 카메라에서 읽기
@@ -267,17 +272,14 @@ class CameraProcessor:
             logger.warning(f"Failed to read frame from camera {self.camera_id}")
             return None
         
-        # MediaPipe로 이미지 처리
+        # MediaPipe로 이미지 처리 - 성능 최적화
         try:
-            # 이미지 반전 - 처리 전에 먼저 적용
-            #image = cv2.flip(image, 0)  # 상하 반전
-            
-            # RGB로 변환 (MediaPipe용)
+            # 성능 향상을 위해 이미지를 읽기 전용으로 설정
             image.flags.writeable = False
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = self.hands.process(image_rgb)
-            
-            # BGR로 다시 변환 (OpenCV용)
+
+            # 처리 완료 후 쓰기 가능으로 변경
             image.flags.writeable = True
             
             # 손 랜드마크 처리
@@ -383,7 +385,7 @@ class CameraProcessor:
                 yield frame_data
             else:
                 # 프레임이 없는 경우 대기
-                time.sleep(0.03)  # ~30fps
+                time.sleep(0.016)  # ~60fps
     
     def close(self):
         """리소스 정리"""

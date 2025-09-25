@@ -182,25 +182,30 @@ class ManipulatorRobot:
             return False
 
     def move(self, positions, arm_type='follower'):
-        if not self.is_connected or arm_type not in self.connected_arms: 
+        if not self.is_connected or arm_type not in self.connected_arms:
             return False
         try:
             sync_writer = self.sync_writers[arm_type]
             sync_writer.clearParam()
-            
+
+            # Pre-calculate all positions for faster processing
+            param_list = []
             for i, dxl_id in enumerate(self.motor_ids[arm_type]):
                 if i < len(positions):
-                    position = int(positions[i])
-                    # Clamp position to safe range
-                    position = max(1, min(4094, position))
+                    position = max(1, min(4094, int(positions[i])))  # Inline clamp
                     param_goal_position = [
-                        DXL_LOBYTE(DXL_LOWORD(position)),
-                        DXL_HIBYTE(DXL_LOWORD(position)),
-                        DXL_LOBYTE(DXL_HIWORD(position)),
-                        DXL_HIBYTE(DXL_HIWORD(position))
+                        position & 0xFF,
+                        (position >> 8) & 0xFF,
+                        (position >> 16) & 0xFF,
+                        (position >> 24) & 0xFF
                     ]
-                    sync_writer.addParam(dxl_id, param_goal_position)
-            
+                    param_list.append((dxl_id, param_goal_position))
+
+            # Batch add parameters
+            for dxl_id, param in param_list:
+                sync_writer.addParam(dxl_id, param)
+
+            # Send without waiting for response (faster)
             result = sync_writer.txPacket()
             return result == 0  # COMM_SUCCESS
         except Exception as e:

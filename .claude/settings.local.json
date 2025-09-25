@@ -51,7 +51,12 @@
       "Read(//tmp/.X11-unix/**)",
       "Bash(export DISPLAY=:0)",
       "Bash(git restore:*)",
-      "Bash(git config:*)"
+      "Bash(git config:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(wget:*)",
+      "Bash(lsof:*)",
+      "Bash(sudo fuser:*)"
     ],
     "deny": [],
     "ask": []

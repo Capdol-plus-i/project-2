@@ -30,7 +30,7 @@ class RobotController:
         self.hand_detected = [False, False]
         self.z = 10
         self.last_status_update = 0
-        self.status_update_interval = 0.1
+        self.status_update_interval = 0.05  # Faster status updates
         
         # Load model
         self.params = None
@@ -44,12 +44,12 @@ class RobotController:
         else:
             logger.warning(f"Model not found at {model_path}, using dummy predictions")
         
-        # Initialize MediaPipe
+        # Initialize MediaPipe with optimized settings
         self.hands = [mp_hands.Hands(
-            model_complexity=1, 
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5, 
-            max_num_hands=2,
+            model_complexity=0,  # Faster but less accurate
+            min_detection_confidence=0.3,  # Lower threshold for faster detection
+            min_tracking_confidence=0.3,
+            max_num_hands=1,  # Only track one hand per camera
             static_image_mode=False
         ) for _ in range(2)]
         
@@ -127,11 +127,13 @@ class RobotController:
                     else:
                         return False
                 
-                # Set camera properties
+                # Set camera properties for higher FPS
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
+                cap.set(cv2.CAP_PROP_FPS, 60)  # Set target FPS
+                cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # Lower exposure for faster capture
                 
                 # Verify camera settings
                 actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -280,8 +282,8 @@ class RobotController:
                         self.tip[1][0] if self.hand_detected[1] else None, 
                         self.tip[1][1] if self.hand_detected[1] else None
                     ] + positions
-                    
-                time.sleep(0.01)
+
+                time.sleep(0.005)  # Faster loop
             except Exception as e:
                 logger.error(f"Processing error: {e}")
                 time.sleep(0.1)
