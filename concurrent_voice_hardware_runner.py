@@ -97,6 +97,14 @@ COMMAND_SYNONYMS = {
     # Arduino LED control
     "LED_OFF": ["꺼", "꺼줘", "불꺼", "불 꺼", "라이트오프", "라이트 오프", "끄자"],
     "LED_ON": ["켜", "켜줘", "불켜", "불 켜", "라이트온", "라이트 온", "키자"],
+    "LED_BRIGHTER": ["밝게", "밝게해", "밝기 업", "더 밝게", "브라이트업"],
+    "LED_DIMMER": ["어둡게", "어둡게해", "밝기 다운", "더 어둡게", "브라이트다운"],
+    "LED_RED": ["빨간불", "빨간색", "빨강", "레드"],
+    "LED_GREEN": ["초록불", "초록색", "초록", "그린"],
+    "LED_BLUE": ["파란불", "파란색", "파랑", "블루"],
+    "LED_YELLOW": ["노란불", "노란색", "노랑", "옐로우"],
+    "LED_WHITE": ["하얀불", "하얀색", "흰색", "화이트"],
+    "LED_RAINBOW": ["무지개", "무지개 불", "레인보우"],
 
     # Hand tracking control
     "TRACKING_ON": ["추적 시작", "시작", "추적 켜", "추적 온", "핸드 트래킹 켜", "손 추적 시작", "트래킹 시작", "트래킹 켜"],
@@ -106,6 +114,19 @@ COMMAND_SYNONYMS = {
     "STOP": ["스톱", "정지", "멈춰", "stop"],
 
     "EXIT": ["그만"]
+}
+
+LED_COMMAND_MAP = {
+    "LED_ON": "ON",
+    "LED_OFF": "OFF",
+    "LED_BRIGHTER": "UP",
+    "LED_DIMMER": "DOWN",
+    "LED_RED": "RED",
+    "LED_GREEN": "GREEN",
+    "LED_BLUE": "BLUE",
+    "LED_YELLOW": "YELLOW",
+    "LED_WHITE": "WHITE",
+    "LED_RAINBOW": "RAINBOW",
 }
 
 # =============================================================================
@@ -300,6 +321,22 @@ def detect_cmd_interim(text: str) -> Optional[str]:
         return "LED_OFF"
     if quick_contains(text, COMMAND_SYNONYMS["LED_ON"]):
         return "LED_ON"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_BRIGHTER"]):
+        return "LED_BRIGHTER"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_DIMMER"]):
+        return "LED_DIMMER"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_RED"]):
+        return "LED_RED"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_GREEN"]):
+        return "LED_GREEN"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_BLUE"]):
+        return "LED_BLUE"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_YELLOW"]):
+        return "LED_YELLOW"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_WHITE"]):
+        return "LED_WHITE"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_RAINBOW"]):
+        return "LED_RAINBOW"
 
     return None
 
@@ -472,21 +509,33 @@ def start_stream(mic_index: Optional[int], mic_hint: str, debug: bool, for_comma
 
 def open_arduino(port: str, baud: int = 9600):
     try:
-        ser = serial.Serial(port, baud, timeout=1)
+        ser = serial.Serial(port, baud, timeout=1, write_timeout=1)
         time.sleep(2)
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            # 일부 플랫폼에서는 버퍼 초기화가 지원되지 않을 수 있음
+            pass
         print(f"✓ Arduino 연결 성공! ({port})")
         return ser
     except Exception as e:
         print(f"❌ Arduino 연결 실패: {e}")
         return None
 
-def send_arduino(ser, cmd: str):
+
+def send_arduino(ser, cmd: str, *, quiet: bool = False) -> bool:
     try:
+        if ser is None or not getattr(ser, "is_open", False):
+            raise RuntimeError("Serial port closed")
         ser.write((cmd + "\n").encode())
         ser.flush()
-        print(f"👉 Arduino: {cmd}")
+        if not quiet:
+            print(f"👉 Arduino: {cmd}")
+        return True
     except Exception as e:
         print(f"❌ Arduino 전송 실패: {e}")
+        return False
 
 # =============================================================================
 # MAIN CONCURRENT HARDWARE RUNNER
@@ -517,6 +566,11 @@ class ConcurrentVoiceHardwareRunner:
         self.debug = debug
         self.arduino = None
         self.voice_thread = None
+        self._arduino_lock = threading.Lock()
+        self._last_arduino_attempt = 0.0
+        self._arduino_retry_interval = 5.0
+        self._last_arduino_ping = 0.0
+        self._arduino_keepalive_interval = 3.0 
 
         # Setup logging
         logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
@@ -579,8 +633,86 @@ class ConcurrentVoiceHardwareRunner:
         # Safe holding position when tracking is disabled
         self.safe_holding_position = [2048, 3328, 1140, 3072]
 
+        # --- Hand coordinate cache (per camera) ---
+        # cache_ttl == 0.0 이면 만료 없이 계속 사용
+        self.cache_ttl = 0.0  # 내부 파라미터: 필요 시 0.3 등으로 변경 가능
+        self.coord_cache = {
+            'left':  {'xy': [np.nan, np.nan], 't': 0.0},
+            'right': {'xy': [np.nan, np.nan], 't': 0.0},
+        }
+
         # Initialize Arduino
-        self.arduino = open_arduino(self.arduino_port)
+        self.ensure_arduino_connected(force=True)
+
+    def ensure_arduino_connected(self, force: bool = False) -> bool:
+        """Ensure the Arduino serial connection is open, with optional forced retry."""
+        if self.test_mode:
+            return False
+
+        with self._arduino_lock:
+            if self.arduino and getattr(self.arduino, "is_open", False):
+                return True
+
+            now = time.time()
+            if not force and (now - self._last_arduino_attempt) < self._arduino_retry_interval:
+                return False
+
+            self._last_arduino_attempt = now
+
+            if self.arduino:
+                try:
+                    self.arduino.close()
+                except Exception:
+                    pass
+                self.arduino = None
+
+        candidate = open_arduino(self.arduino_port)
+
+        with self._arduino_lock:
+            if candidate and getattr(candidate, "is_open", False):
+                self.arduino = candidate
+                self._last_arduino_ping = time.time()
+                return True
+
+            self.arduino = None
+            self._last_arduino_ping = 0.0
+            return False
+
+    def _mark_arduino_disconnected(self) -> None:
+        """Close and clear Arduino connection state."""
+        with self._arduino_lock:
+            if self.arduino:
+                try:
+                    self.arduino.close()
+                except Exception:
+                    pass
+            self.arduino = None
+            self._last_arduino_attempt = 0.0
+            self._last_arduino_ping = 0.0
+
+    # ----------------- Cache helper -----------------
+    def _cache_and_fill(self, camera_name: str, xy: List[float]) -> List[float]:
+        """
+        xy에 유효값이 있으면 캐시에 저장하고 그대로 반환.
+        NaN이면 캐시에 든 값을 (TTL 이내라면) 반환, 없으면 [nan, nan].
+        """
+        now = time.time()
+        cache = self.coord_cache.get(camera_name)
+        if cache is None:
+            cache = {'xy': [np.nan, np.nan], 't': 0.0}
+            self.coord_cache[camera_name] = cache
+
+        arr = np.asarray(xy, dtype=np.float32)
+        if np.isfinite(arr).all():
+            cache['xy'] = [float(arr[0]), float(arr[1])]
+            cache['t'] = now
+            return cache['xy']
+
+        # 결측: 캐시 사용 (TTL==0 이면 무제한)
+        age = now - cache['t']
+        if np.isfinite(cache['xy']).all() and (self.cache_ttl <= 0.0 or age <= self.cache_ttl):
+            return cache['xy']
+        return [np.nan, np.nan]
 
     def load_model(self):
         """Load XGBoost or PyTorch model (same as hardware_runner.py)"""
@@ -987,13 +1119,16 @@ class ConcurrentVoiceHardwareRunner:
         return frames
 
     def extract_hand_features(self, frame, camera_name):
-        """Extract hand features from frame"""
+        """Extract hand features from frame (with cache fallback)"""
         if frame is None:
-            return [np.nan, np.nan], None
+            # 프레임 자체가 없을 때도 캐시로 대체
+            xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
+            return xy, None
 
         try:
             if frame.size == 0 or len(frame.shape) != 3:
-                return [np.nan, np.nan], frame.copy()
+                xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
+                return xy, frame.copy()
 
             hands_processor = self.hands_left if camera_name == 'left' else self.hands_right
             frame.flags.writeable = False
@@ -1001,6 +1136,8 @@ class ConcurrentVoiceHardwareRunner:
             results = hands_processor.process(rgb_frame)
             frame.flags.writeable = True
             display_frame = frame.copy()
+
+            raw_xy = [np.nan, np.nan]
 
             if results.multi_hand_landmarks:
                 hand_landmarks = results.multi_hand_landmarks[0]
@@ -1011,13 +1148,16 @@ class ConcurrentVoiceHardwareRunner:
                     x = index_tip.x * w
                     y = index_tip.y * h
                     if 0 <= x <= w and 0 <= y <= h:
-                        return [float(x), float(y)], display_frame
+                        raw_xy = [float(x), float(y)]
 
-            return [np.nan, np.nan], display_frame
+            # 캐시 보정 적용
+            xy = self._cache_and_fill(camera_name, raw_xy)
+            return xy, display_frame
 
         except Exception as e:
             self.logger.error(f"Hand detection error in {camera_name}: {e}")
-            return [np.nan, np.nan], frame.copy()
+            xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
+            return xy, frame.copy()
 
     def predict_joint_positions(self, features):
         """Predict joint positions using loaded model"""
@@ -1092,8 +1232,10 @@ class ConcurrentVoiceHardwareRunner:
                            (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.4, voice_color, 2)
 
                 # Arduino status
-                arduino_color = (0, 255, 0) if self.arduino and self.arduino.is_open else (0, 0, 255)
-                cv2.putText(display_frame, f"ARDUINO: {'OK' if self.arduino and self.arduino.is_open else 'DISCONNECTED'}",
+                with self._arduino_lock:
+                    arduino_ready = bool(self.arduino and getattr(self.arduino, "is_open", False))
+                arduino_color = (0, 255, 0) if arduino_ready else (0, 0, 255)
+                cv2.putText(display_frame, f"ARDUINO: {'OK' if arduino_ready else 'DISCONNECTED'}",
                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, arduino_color, 2)
 
                 # Add hand tracking visualization if tracking is enabled
@@ -1236,6 +1378,28 @@ class ConcurrentVoiceHardwareRunner:
 
         print("🔇 Voice recognition thread stopped")
 
+    def arduino_reader_thread_func(self):
+        """Background thread to continuously read Arduino serial data"""
+        print("📖 Arduino reader thread started")
+        while self.arduino_reader_active and self.running:
+            try:
+                with self._arduino_lock:
+                    if self.arduino and getattr(self.arduino, "is_open", False):
+                        # Read any available data to prevent buffer overflow
+                        if self.arduino.in_waiting > 0:
+                            try:
+                                line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
+                                if line and self.debug:
+                                    print(f"[Arduino] {line}")
+                            except Exception as e:
+                                if self.debug:
+                                    self.logger.error(f"Arduino read error: {e}")
+                time.sleep(0.1)  # Small delay to prevent CPU spinning
+            except Exception as e:
+                self.logger.error(f"Arduino reader thread error: {e}")
+                time.sleep(1.0)
+        print("📖 Arduino reader thread stopped")
+
     def handle_voice_command(self, command):
         """Handle recognized voice command"""
         print(f"🗣️ Voice Command: {command}")
@@ -1266,10 +1430,16 @@ class ConcurrentVoiceHardwareRunner:
             print("📷 Hand tracking ENABLED - Robot will follow hand movements")
 
         # Arduino LED control
-        elif command in ["LED_ON", "LED_OFF"]:
-            arduino_cmd = "ON" if command == "LED_ON" else "OFF"
-            if self.arduino:
-                send_arduino(self.arduino, arduino_cmd)
+        elif command in LED_COMMAND_MAP:
+            arduino_cmd = LED_COMMAND_MAP[command]
+            if self.ensure_arduino_connected(force=True):
+                success = False
+                with self._arduino_lock:
+                    if self.arduino and getattr(self.arduino, "is_open", False):
+                        success = send_arduino(self.arduino, arduino_cmd)
+                if not success:
+                    print(f"⚠️ Arduino 전송 실패 - 연결을 재시도합니다 ({arduino_cmd})")
+                    self._mark_arduino_disconnected()
             else:
                 print(f"⚠️ Arduino not connected, cannot send {arduino_cmd}")
 
@@ -1283,6 +1453,12 @@ class ConcurrentVoiceHardwareRunner:
         # Start camera threads
         self.start_camera_threads()
 
+        # Start Arduino reader thread
+        if not self.test_mode:
+            self.arduino_reader_active = True
+            self.arduino_reader_thread = threading.Thread(target=self.arduino_reader_thread_func, daemon=True)
+            self.arduino_reader_thread.start()
+
         # Start voice recognition thread
         if self.voice_active:
             self.voice_thread = threading.Thread(target=self.voice_recognition_thread, daemon=True)
@@ -1291,6 +1467,25 @@ class ConcurrentVoiceHardwareRunner:
         try:
             while self.running:
                 loop_start = time.time()
+
+                # Opportunistically keep Arduino connection alive
+                self.ensure_arduino_connected()
+
+                arduino_ref = None
+                should_ping = False
+                if not self.test_mode:
+                    with self._arduino_lock:
+                        if self.arduino and getattr(self.arduino, "is_open", False):
+                            arduino_ref = self.arduino
+                            if time.time() - self._last_arduino_ping >= self._arduino_keepalive_interval:
+                                should_ping = True
+
+                if should_ping and arduino_ref:
+                    if send_arduino(arduino_ref, "STATUS", quiet=True):
+                        with self._arduino_lock:
+                            self._last_arduino_ping = time.time()
+                    else:
+                        self._mark_arduino_disconnected()
 
                 # Get camera frames
                 frames = self.get_latest_frames()
@@ -1362,6 +1557,11 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Error during servo cleanup: {e}")
 
+        # Stop Arduino reader thread
+        if self.arduino_reader_thread and self.arduino_reader_thread.is_alive():
+            self.arduino_reader_active = False
+            self.arduino_reader_thread.join(timeout=2.0)
+
         # Stop voice thread
         if self.voice_thread and self.voice_thread.is_alive():
             self.voice_thread.join(timeout=2.0)
@@ -1382,16 +1582,19 @@ class ConcurrentVoiceHardwareRunner:
             cv2.destroyAllWindows()
 
         # Turn off Arduino LED and close connection
-        if self.arduino and self.arduino.is_open:
+        with self._arduino_lock:
+            arduino_ref = self.arduino if self.arduino and getattr(self.arduino, "is_open", False) else None
+
+        if arduino_ref:
             try:
                 self.logger.info("Turning off Arduino LED...")
-                send_arduino(self.arduino, "OFF")
-                time.sleep(0.5)  # Brief delay for command to process
-                self.logger.info("Arduino LED turned off")
+                if send_arduino(arduino_ref, "OFF"):
+                    time.sleep(0.5)  # Brief delay for command to process
+                    self.logger.info("Arduino LED turned off")
             except Exception as e:
                 self.logger.error(f"Failed to turn off Arduino LED: {e}")
 
-            self.arduino.close()
+        self._mark_arduino_disconnected()
 
         # Close servo port
         if not self.test_mode and DynamixelSDK_available and hasattr(self, 'port_handler'):
@@ -1437,6 +1640,8 @@ def main():
     print("  Hand tracking: '추적 시작'")
     print("  Robot control: '정지' (stop at current position) / '홈' (go to home)")
     print("  Arduino LEDs: '켜' / '꺼'")
+    print("  Brightness: '밝게' / '어둡게'")
+    print("  Colors: '빨간불', '초록불', '파란불', '노란불', '하얀불', '무지개'")
     print("  System: '종료'")
     print()
     print("Default: Hand tracking DISABLED")
