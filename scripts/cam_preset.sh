@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # Camera device definitions
-LEFT_CAM="/dev/video0"
-RIGHT_CAM="/dev/video2"
+LEFT_CAM="/dev/cam_left"
+RIGHT_CAM="/dev/cam_right"
 
 # Common settings for both cameras
 CONTRAST=255
 SATURATION=255
-GAMMA=35
+GAMMA=30
 GAIN=0
 SHARPNESS=0
 POWER_LINE_FREQ=2  # 60 Hz
@@ -16,7 +16,7 @@ AUTO_EXPOSURE=3    # Aperture Priority Mode
 FOCUS_AUTO=1       # Auto focus enabled
 
 # Different brightness settings
-LEFT_BRIGHTNESS=-150    # Brighter for left camera
+LEFT_BRIGHTNESS=-145    # Brighter for left camera
 RIGHT_BRIGHTNESS=-200 # Keep right camera darker
 
 # Configure left camera

@@ -39,11 +39,9 @@
   "cameras": {
     "enabled": true,
     "cam_left": {
-      "id": 0,
       "enabled": true
     },
     "cam_right": {
-      "id": 2,
       "enabled": true
     },
     "auto_detect": true
