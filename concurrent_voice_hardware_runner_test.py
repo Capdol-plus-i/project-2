@@ -16,15 +16,11 @@ import time
 import json
 import argparse
 import logging
-from datetime import datetime
 import mediapipe as mp
-from sklearn.preprocessing import StandardScaler
-import sys
 import os
-import subprocess
-import platform
 import threading
 from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 import joblib
 import re
 import unicodedata
@@ -34,6 +30,7 @@ import ctypes
 import ctypes.util
 import struct
 from typing import Optional, List, Tuple, Sequence
+import math  # <<< 추가: 로그스케일 감속용
 
 # Hardware imports
 try:
@@ -49,14 +46,6 @@ import serial
 import pyaudio
 import webrtcvad
 from google.cloud import speech
-
-# Jetson optimization imports
-try:
-    import tensorrt as trt
-    import torch_tensorrt
-    TENSORRT_AVAILABLE = True
-except ImportError:
-    TENSORRT_AVAILABLE = False
 
 # Suppress audio/logging noise
 os.environ["GRPC_VERBOSITY"] = "NONE"
@@ -112,6 +101,7 @@ COMMAND_SYNONYMS = {
 
     # Robot position control
     "STOP": ["스톱", "정지", "멈춰", "stop"],
+    "EMERGENCY_RESET": ["리셋", "복구", "재시작", "긴급복구", "reset", "리셋해줘"],
 
     "EXIT": ["그만"]
 }
@@ -128,6 +118,9 @@ LED_COMMAND_MAP = {
     "LED_WHITE": "WHITE",
     "LED_RAINBOW": "RAINBOW",
 }
+
+# Robot position constants
+DEFAULT_HOME_POSITION = [2048, 3328, 1140, 3072]
 
 # =============================================================================
 # PYTORCH MODEL CLASSES
@@ -300,9 +293,13 @@ def detect_wake_interim(text: str) -> bool:
     return quick_contains(text, keys)
 
 def detect_cmd_interim(text: str) -> Optional[str]:
-    # Priority order: EXIT → Robot control → Hand tracking control → Arduino commands
+    # Priority order: EXIT → Emergency reset → Robot control → Hand tracking control → Arduino commands
     if quick_contains(text, COMMAND_SYNONYMS["EXIT"]):
         return "EXIT"
+
+    # Emergency reset (high priority)
+    if quick_contains(text, COMMAND_SYNONYMS["EMERGENCY_RESET"]):
+        return "EMERGENCY_RESET"
 
     # Robot position control
     if quick_contains(text, COMMAND_SYNONYMS["STOP"]):
@@ -455,12 +452,6 @@ class MicrophoneStream:
             if chunk is None:
                 return
             pcm16k = self._to_mono_16k(chunk)
-            if self.debug:
-                try:
-                    voiced = self.vad.is_speech(pcm16k[:FRAME_BYTES], TARGET_RATE)
-                    print(f"\r[VAD] {'speech' if voiced else 'silence'}", end="", flush=True)
-                except:
-                    pass
             yield pcm16k
 
 # =============================================================================
@@ -566,6 +557,8 @@ class ConcurrentVoiceHardwareRunner:
         self.debug = debug
         self.arduino = None
         self.voice_thread = None
+        self.arduino_reader_thread = None
+        self.arduino_reader_active = False
         self._arduino_lock = threading.Lock()
         self._last_arduino_attempt = 0.0
         self._arduino_retry_interval = 5.0
@@ -603,7 +596,6 @@ class ConcurrentVoiceHardwareRunner:
         self.camera_threads = {}
         self.capture_active = False
         self.cameras = {}
-        self.camera_color_converters = {}
 
         self.setup_cameras()
         self.setup_mediapipe()
@@ -618,28 +610,39 @@ class ConcurrentVoiceHardwareRunner:
             self.setup_servo_defaults()
 
         # Safety and control variables
-        self.frame_count = 0
-        self.total_inference_time = 0.0
-        self.last_fps_time = time.time()
         self.consecutive_failures = 0
         self.max_consecutive_failures = 10
-        self.last_successful_positions = [2048, 3328, 1140, 3072]
-        self.position_smoothing_alpha = 0.3
-        self.last_positions = [2048, 3328, 1140, 3072]
+        self.last_successful_positions = DEFAULT_HOME_POSITION.copy()
+        self.position_smoothing_alpha = 0.6
+
+        self.last_positions = DEFAULT_HOME_POSITION.copy()
         self.emergency_stop = False
         self.safe_zone_min = [1280, 1920, 1120, 1664]
         self.safe_zone_max = [2944, 3456, 3200, 3136]
 
         # Safe holding position when tracking is disabled
-        self.safe_holding_position = [2048, 3328, 1140, 3072]
+        self.safe_holding_position = DEFAULT_HOME_POSITION.copy()
 
-        # --- Hand coordinate cache (per camera) ---
-        # cache_ttl == 0.0 이면 만료 없이 계속 사용
-        self.cache_ttl = 0.0  # 내부 파라미터: 필요 시 0.3 등으로 변경 가능
+        # Track last sent positions to avoid duplicate commands
+        self.last_sent_positions = None
+
+        # Hand coordinate cache (per camera) - TTL: 0.5s
+        self.cache_ttl = 0.5
         self.coord_cache = {
             'left':  {'xy': [np.nan, np.nan], 't': 0.0},
             'right': {'xy': [np.nan, np.nan], 't': 0.0},
         }
+
+        # 로그스케일 감속 파라미터 + 현재 위치 캐시  <<< 추가
+        self.enable_log_alpha = True     # True면 로그스케일 α 사용
+        self.alpha_min = 0.05            # 목표 근처에서의 최소 α
+        self.alpha_max = 0.80            # 멀리 떨어졌을 때의 최대 α
+        self.alpha_log_k = 5.0          # 로그 곡률(5~12 권장)
+        self.alpha_deadband = 1          # [pulse] 이내면 매우 작게 감속
+        self.current_positions = DEFAULT_HOME_POSITION.copy()
+
+        # ThreadPoolExecutor for parallel hand tracking
+        self.hand_tracking_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hand_track")
 
         # Initialize Arduino
         self.ensure_arduino_connected(force=True)
@@ -666,7 +669,21 @@ class ConcurrentVoiceHardwareRunner:
                     pass
                 self.arduino = None
 
-        candidate = open_arduino(self.arduino_port)
+        # Open Arduino connection (integrated from open_arduino function)
+        candidate = None
+        try:
+            ser = serial.Serial(self.arduino_port, 9600, timeout=1, write_timeout=1)
+            time.sleep(2)
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+            except Exception:
+                pass  # Some platforms don't support buffer reset
+            self.logger.info(f"✓ Arduino connected ({self.arduino_port})")
+            candidate = ser
+        except Exception as e:
+            self.logger.error(f"❌ Arduino connection failed: {e}")
+            candidate = None
 
         with self._arduino_lock:
             if candidate and getattr(candidate, "is_open", False):
@@ -721,7 +738,7 @@ class ConcurrentVoiceHardwareRunner:
         self.scaler_X = None
         self.scaler_y = None
 
-        if self.model_path.lower().endswith(".joblib"):
+        if self.model_path and self.model_path.lower().endswith(".joblib"):
             self.logger.info(f"Loading XGBoost model from {self.model_path}")
             self.model = joblib.load(self.model_path)
             self.model_type = "xgb"
@@ -885,15 +902,15 @@ class ConcurrentVoiceHardwareRunner:
         self.hands_left = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.2,
-            min_tracking_confidence=0.2,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.1,
             model_complexity=0
         )
         self.hands_right = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.2,
-            min_tracking_confidence=0.2,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.1,
             model_complexity=0
         )
         self.mp_drawing = mp.solutions.drawing_utils
@@ -944,6 +961,15 @@ class ConcurrentVoiceHardwareRunner:
         goal_position_addr = robot_config.get('addr_goal_position', 116)
         self.group_sync_write = GroupSyncWrite(self.port_handler, self.packet_handler, goal_position_addr, 4)
 
+        # --- 추가: Group Sync Read (Present Position=132, 4 bytes) ---
+        present_position_addr = 132
+        present_position_len  = 4
+        self.group_sync_read = GroupSyncRead(
+            self.port_handler, self.packet_handler, present_position_addr, present_position_len
+        )
+        for sid in self.servo_ids:
+            self.group_sync_read.addParam(sid)
+
         self.enable_torque()
         self.logger.info(f"Servos initialized on {port}")
 
@@ -985,6 +1011,40 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Exception disabling torque for servo {servo_id}: {e}")
 
+    # --- 추가: 현재 위치 읽기 ---
+    def read_present_positions(self) -> Optional[List[int]]:
+        """GroupSyncRead로 각 모터의 현재 위치(132)를 읽어 self.current_positions 갱신."""
+        if self.test_mode or not DynamixelSDK_available:
+            return None
+        try:
+            dxl_comm_result = self.group_sync_read.txRxPacket()
+            if dxl_comm_result != COMM_SUCCESS:
+                return None
+
+            positions = []
+            for sid in self.servo_ids:
+                # 132 주소에서 4바이트 가능 여부 확인 후 getData
+                if not self.group_sync_read.isAvailable(sid, 132, 4):
+                    return None
+                pos = self.group_sync_read.getData(sid, 132, 4)
+                positions.append(int(pos))
+
+            self.current_positions = positions
+            return positions
+        except Exception as e:
+            self.logger.error(f"read_present_positions() failed: {e}")
+            return None
+
+    # --- 추가: 로그스케일 α 계산 ---
+    def _alpha_log(self, err_norm: float) -> float:
+        """
+        0..1로 정규화된 오차(err_norm)를 α로 변환.
+        작은 오차→작은 α, 큰 오차→큰 α (log1p 곡선)
+        """
+        k = float(self.alpha_log_k)
+        frac = math.log1p(k * max(0.0, min(1.0, err_norm))) / math.log1p(k)
+        return float(self.alpha_min + (self.alpha_max - self.alpha_min) * frac)
+
     def send_servo_commands(self, positions):
         """Send position commands to servos"""
         if self.test_mode or not DynamixelSDK_available:
@@ -994,17 +1054,18 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.warning("Emergency stop active - not sending commands")
             return False
 
-        try:
-            # Safety check
+        # Skip if positions haven't changed (within 1 unit tolerance)
+        if self.last_sent_positions is not None:
+            positions_changed = False
             for i, pos in enumerate(positions):
-                min_safe = self.safe_zone_min[i] if i < len(self.safe_zone_min) else 1200
-                max_safe = self.safe_zone_max[i] if i < len(self.safe_zone_max) else 2896
+                if i >= len(self.last_sent_positions) or abs(pos - self.last_sent_positions[i]) > 1:
+                    positions_changed = True
+                    break
+            if not positions_changed:
+                return True
 
-                if pos < min_safe or pos > max_safe:
-                    self.logger.error(f"Refusing unsafe position {pos} for joint {i}")
-                    self.emergency_stop = True
-                    return False
-
+        try:
+            # Note: Safety check is performed in clamp_positions() before calling this method
             # Clear and add parameters
             self.group_sync_write.clearParam()
 
@@ -1025,6 +1086,7 @@ class ConcurrentVoiceHardwareRunner:
 
             if success:
                 self.last_successful_positions = positions.copy()
+                self.last_sent_positions = positions.copy()  # Track for duplicate prevention
                 self.consecutive_failures = 0
             else:
                 self.consecutive_failures += 1
@@ -1040,27 +1102,58 @@ class ConcurrentVoiceHardwareRunner:
                 self.emergency_stop = True
             return False
 
+    # --- 수정: 현재 위치 기반 로그스케일 감속 클램프 ---
     def clamp_positions(self, positions):
-        """Apply safety constraints and smooth position changes"""
+        """
+        안전 범위로 클램프 + '현재 위치' 기반 로그스케일 α 감속.
+        - 목표와 현재 위치 차이가 클수록 크게(빠르게) 이동
+        - 목표 근접(데드밴드 이내) 시 α를 확 낮춰 잔떨림 억제
+        """
         if self.emergency_stop:
             return self.last_positions.copy()
+
+        # 최신 현재 위치 읽기 (실패 시 기존 캐시 사용)
+        self.read_present_positions()
+        base_positions = self.current_positions if self.current_positions else self.last_positions
 
         safe_positions = []
         for i, pos in enumerate(positions):
             min_pos = self.safe_zone_min[i]
             max_pos = self.safe_zone_max[i]
-            safe_pos = max(min_pos, min(max_pos, int(pos)))
+            target   = max(min_pos, min(max_pos, int(pos)))
 
-            if i < len(self.last_positions):
-                last_pos = self.last_positions[i]
-                smoothed_pos = (self.position_smoothing_alpha * safe_pos +
-                               (1 - self.position_smoothing_alpha) * last_pos)
-                safe_pos = int(smoothed_pos)
+            # 실제 현재 위치를 기준으로 오차 계산
+            cur = base_positions[i] if i < len(base_positions) else target
+            err = abs(target - cur)
+            rng = max(1, max_pos - min_pos)          # 정규화 범위
 
-            safe_positions.append(safe_pos)
+            if self.enable_log_alpha:
+                if err <= self.alpha_deadband:
+                    alpha = max(0.02, self.alpha_min * 0.3)   # 데드밴드 이내: 아주 부드럽게
+                else:
+                    alpha = self._alpha_log(err_norm=min(1.0, err / rng))
+            else:
+                alpha = float(self.position_smoothing_alpha)
+
+            # 현재 위치에서 목표 쪽으로 α 만큼만 이동 (한 틱 step)
+            step = alpha * (target - cur)
+            new_pos = int(cur + step)
+
+            # (옵션) 과도 점프 방지용 step limit
+            # step_limit = max(1, int(0.12 * rng))
+            # delta = new_pos - cur
+            # if abs(delta) > step_limit:
+            #     new_pos = cur + step_limit * (1 if delta > 0 else -1)
+
+            safe_positions.append(new_pos)
 
         self.last_positions = safe_positions.copy()
         return safe_positions
+
+    def move_to_position(self, positions):
+        """Clamp positions and send to servos (helper method)"""
+        clamped = self.clamp_positions(positions)
+        return self.send_servo_commands(clamped)
 
     def start_camera_threads(self):
         """Start camera capture threads"""
@@ -1132,7 +1225,8 @@ class ConcurrentVoiceHardwareRunner:
 
             hands_processor = self.hands_left if camera_name == 'left' else self.hands_right
             frame.flags.writeable = False
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # NumPy slicing for faster BGR→RGB conversion (still faster than cv2.cvtColor)
+            rgb_frame = frame[:, :, ::-1].copy()
             results = hands_processor.process(rgb_frame)
             frame.flags.writeable = True
             display_frame = frame.copy()
@@ -1141,7 +1235,9 @@ class ConcurrentVoiceHardwareRunner:
 
             if results.multi_hand_landmarks:
                 hand_landmarks = results.multi_hand_landmarks[0]
-                self.mp_drawing.draw_landmarks(display_frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                # Only draw landmarks when display is enabled
+                if self.show_display:
+                    self.mp_drawing.draw_landmarks(display_frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
                 index_tip = hand_landmarks.landmark[8]
                 if 0 <= index_tip.x <= 1 and 0 <= index_tip.y <= 1:
                     h, w = frame.shape[:2]
@@ -1203,7 +1299,8 @@ class ConcurrentVoiceHardwareRunner:
 
         for camera_name, frame in frames.items():
             if frame is not None:
-                display_frame = frame.copy()
+                # Use the frame directly (already processed in extract_hand_features)
+                display_frame = frame
 
                 # Add status indicators
                 cv2.rectangle(display_frame, (10, 10), (300, 110), (0, 0, 0), -1)
@@ -1237,6 +1334,17 @@ class ConcurrentVoiceHardwareRunner:
                 arduino_color = (0, 255, 0) if arduino_ready else (0, 0, 255)
                 cv2.putText(display_frame, f"ARDUINO: {'OK' if arduino_ready else 'DISCONNECTED'}",
                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, arduino_color, 2)
+
+                # Emergency stop warning (prominent visual alert)
+                if self.emergency_stop:
+                    # Red border around entire frame
+                    cv2.rectangle(display_frame, (5, 5), (635, 475), (0, 0, 255), 5)
+                    # Large warning text in center
+                    cv2.putText(display_frame, "EMERGENCY STOP!",
+                               (150, 250), cv2.FONT_HERSHEY_BOLD, 1.5, (0, 0, 255), 4)
+                    # Recovery instruction
+                    cv2.putText(display_frame, 'Say: "RESET"',
+                               (200, 290), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
                 # Add hand tracking visualization if tracking is enabled
                 if self.hand_tracking_enabled:
@@ -1298,8 +1406,6 @@ class ConcurrentVoiceHardwareRunner:
                                 if res.alternatives and not res.is_final:
                                     text = res.alternatives[0].transcript.strip()
                                     if text and detect_wake_interim(text):
-                                        if self.debug:
-                                            print(f"[WAKE] {text}")
                                         got_wake = True
                                         break
                             if got_wake:
@@ -1347,8 +1453,6 @@ class ConcurrentVoiceHardwareRunner:
                                     if text:
                                         cmd = detect_cmd_interim(text)
                                         if cmd:
-                                            if self.debug:
-                                                print(f"[CMD] {text} -> {cmd}")
                                             self.handle_voice_command(cmd)
                                             command_detected = True
                                             break
@@ -1378,6 +1482,28 @@ class ConcurrentVoiceHardwareRunner:
 
         print("🔇 Voice recognition thread stopped")
 
+    def arduino_reader_thread_func(self):
+        """Background thread to continuously read Arduino serial data"""
+        print("📖 Arduino reader thread started")
+        while self.arduino_reader_active and self.running:
+            try:
+                with self._arduino_lock:
+                    if self.arduino and getattr(self.arduino, "is_open", False):
+                        # Read any available data to prevent buffer overflow
+                        if self.arduino.in_waiting > 0:
+                            try:
+                                line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
+                                if line and self.debug:
+                                    print(f"[Arduino] {line}")
+                            except Exception as e:
+                                if self.debug:
+                                    self.logger.error(f"Arduino read error: {e}")
+                time.sleep(0.1)  # Small delay to prevent CPU spinning
+            except Exception as e:
+                self.logger.error(f"Arduino reader thread error: {e}")
+                time.sleep(1.0)
+        print("📖 Arduino reader thread stopped")
+
     def handle_voice_command(self, command):
         """Handle recognized voice command"""
         print(f"🗣️ Voice Command: {command}")
@@ -1385,6 +1511,32 @@ class ConcurrentVoiceHardwareRunner:
         if command == "EXIT":
             print("🛑 Exit command received")
             self.running = False
+
+        # Emergency reset
+        elif command == "EMERGENCY_RESET":
+            print("🔄 EMERGENCY RESET - Recovering system...")
+            if self.emergency_stop:
+                # Move to safe home position
+                if not self.test_mode:
+                    safe_home = self.safe_holding_position
+                    # Temporarily allow movement by clearing emergency stop
+                    temp_emergency = self.emergency_stop
+                    self.emergency_stop = False
+                    success = self.move_to_position(safe_home)
+                    if success:
+                        self.consecutive_failures = 0
+                        self.robot_stopped = False
+                        self.hand_tracking_enabled = False
+                        print("✅ System RECOVERED - Emergency stop cleared, moved to HOME")
+                    else:
+                        self.emergency_stop = temp_emergency
+                        print("❌ Recovery FAILED - System still in emergency stop")
+                else:
+                    self.emergency_stop = False
+                    self.consecutive_failures = 0
+                    print("✅ System RECOVERED (test mode)")
+            else:
+                print("ℹ️ System is not in emergency stop")
 
         # Robot position control
         elif command == "STOP":
@@ -1395,11 +1547,11 @@ class ConcurrentVoiceHardwareRunner:
         elif command == "GO_HOME":
             self.robot_stopped = False
             self.hand_tracking_enabled = False
+            self.consecutive_failures = 0  # Reset communication failure counter
             print("🏠 Going HOME - Moving to safe position")
             # Move to safe home position immediately
             if not self.test_mode:
-                clamped_positions = self.clamp_positions(self.safe_holding_position)
-                self.send_servo_commands(clamped_positions)
+                self.move_to_position(self.safe_holding_position)
 
         # Hand tracking control
         elif command == "TRACKING_ON":
@@ -1431,6 +1583,12 @@ class ConcurrentVoiceHardwareRunner:
         # Start camera threads
         self.start_camera_threads()
 
+        # Start Arduino reader thread
+        if not self.test_mode:
+            self.arduino_reader_active = True
+            self.arduino_reader_thread = threading.Thread(target=self.arduino_reader_thread_func, daemon=True)
+            self.arduino_reader_thread.start()
+
         # Start voice recognition thread
         if self.voice_active:
             self.voice_thread = threading.Thread(target=self.voice_recognition_thread, daemon=True)
@@ -1461,13 +1619,29 @@ class ConcurrentVoiceHardwareRunner:
 
                 # Get camera frames
                 frames = self.get_latest_frames()
-                left_features, left_processed = self.extract_hand_features(frames.get('left'), 'left')
-                right_features, right_processed = self.extract_hand_features(frames.get('right'), 'right')
 
-                if left_processed is not None:
-                    frames['left'] = left_processed
-                if right_processed is not None:
-                    frames['right'] = right_processed
+                # Performance optimization: Only process hand tracking when needed
+                if self.hand_tracking_enabled or self.show_display:
+                    # Parallel processing for both cameras using ThreadPoolExecutor
+                    left_future = self.hand_tracking_executor.submit(
+                        self.extract_hand_features, frames.get('left'), 'left'
+                    )
+                    right_future = self.hand_tracking_executor.submit(
+                        self.extract_hand_features, frames.get('right'), 'right'
+                    )
+
+                    # Wait for both to complete (happens in parallel)
+                    left_features, left_processed = left_future.result()
+                    right_features, right_processed = right_future.result()
+
+                    if left_processed is not None:
+                        frames['left'] = left_processed
+                    if right_processed is not None:
+                        frames['right'] = right_processed
+                else:
+                    # Skip hand tracking entirely when disabled and display is off
+                    left_features = [np.nan, np.nan]
+                    right_features = [np.nan, np.nan]
 
                 if self.show_display:
                     self.update_display(frames, left_features, right_features)
@@ -1479,19 +1653,13 @@ class ConcurrentVoiceHardwareRunner:
                 elif self.hand_tracking_enabled and self.model is not None:
                     # Hand tracking is enabled - use camera prediction
                     combined_features = left_features + right_features
-                    predicted_positions = self.predict_joint_positions(combined_features)
-                    final_positions = predicted_positions
-                    # Apply safety and send to servos
-                    if not self.test_mode:
-                        clamped_positions = self.clamp_positions(final_positions)
-                        self.send_servo_commands(clamped_positions)
+                    final_positions = self.predict_joint_positions(combined_features)
                 else:
                     # Hand tracking disabled - use safe holding position
                     final_positions = self.safe_holding_position
-                    # Apply safety and send to servos
-                    if not self.test_mode:
-                        clamped_positions = self.clamp_positions(final_positions)
-                        self.send_servo_commands(clamped_positions)
+
+                # Move to target position (common logic)
+                self.move_to_position(final_positions)
 
                 # Frame rate control
                 elapsed = time.time() - loop_start
@@ -1514,9 +1682,7 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.info("Moving servos to home position...")
             try:
                 # Move to safe home position
-                home_positions = [2048, 3328, 1140, 3072]  # Safe neutral position
-                clamped_positions = self.clamp_positions(home_positions)
-                if self.send_servo_commands(clamped_positions):
+                if self.move_to_position(DEFAULT_HOME_POSITION):
                     time.sleep(1.0)  # Allow time to reach position
                     self.logger.info("Servos moved to home position")
                 else:
@@ -1529,9 +1695,19 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Error during servo cleanup: {e}")
 
+        # Stop Arduino reader thread
+        if self.arduino_reader_thread and self.arduino_reader_thread.is_alive():
+            self.arduino_reader_active = False
+            self.arduino_reader_thread.join(timeout=2.0)
+
         # Stop voice thread
         if self.voice_thread and self.voice_thread.is_alive():
             self.voice_thread.join(timeout=2.0)
+
+        # Shutdown hand tracking executor
+        if hasattr(self, 'hand_tracking_executor'):
+            self.hand_tracking_executor.shutdown(wait=True, cancel_futures=True)
+            self.logger.info("Hand tracking executor shutdown")
 
         # Stop camera threads
         self.stop_camera_threads()
