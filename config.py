@@ -41,7 +41,7 @@ ROBOT_ARMS_CONFIG = {
         'enabled': True
     },
     'auto_detect': True,                # Try to auto-detect robot arm ports
-    'position_p_gain': [200, 200, 400, 200]
+    'position_p_gain': [100, 100, 200, 100]
 }
 
 # Camera Configuration

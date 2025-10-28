@@ -16,6 +16,7 @@
       "port": "/dev/follower_arm",
       "baudrate": 1000000,
       "enabled": true,
+      "position_p_gains": [640, 640, 640, 100],
       "motors": {
         "1": {"model": "XL430-W250-T", "center": 2048, "resolution": 0.088},
         "2": {"model": "XL430-W250-T", "center": 2048, "resolution": 0.088},
@@ -29,7 +30,7 @@
       "enabled": true,
       "motors": {
         "1": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
-        "2": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
+        "2": {"model": "XL330-M288-T", "center": 2048, "resolution": 0.088},
         "3": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088},
         "4": {"model": "XL330-M077-T", "center": 2048, "resolution": 0.088}
       }

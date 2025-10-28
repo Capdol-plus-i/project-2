@@ -169,7 +169,7 @@ Task tProcessButtons(50, TASK_FOREVER, &processButtonsTask);
 Task tUpdateNeopixel(50, TASK_FOREVER, &updateNeopixelTask);  // 더 부드러운 LED 효과를 위해 50ms로 단축
 Task tProcessSerial(100, TASK_FOREVER, &processSerialTask);
 Task tHeartbeat(HEARTBEAT_INTERVAL, TASK_FOREVER, &heartbeatTask);
-Task tProcessMPU6050(LOOP_DELAY_MS, TASK_FOREVER, &processMPU6050Task);
+Task tProcessMPU6050(LOOP_DELAY_MS, 0, &processMPU6050Task);
 
 // 버튼 인터럽트 핸들러 (디바운싱 포함)
 void ledButtonInterrupt() {
@@ -206,9 +206,9 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(400000);
-  mpuInit();
-  calibrateAccel();
-  calibrateNoiseFloor();
+  //mpuInit();
+  //calibrateAccel();
+  //calibrateNoiseFloor();
 
   // 시작 시 LED 효과 제거 (바로 꺼진 상태로 시작)
   startupEffect();
@@ -659,6 +659,74 @@ void updateNeopixelTask() {
           int g = currentG * currentBrightness / 255 * progress;
           int b = currentB * currentBrightness / 255 * progress;
           setAllPixels(r, g, b);
+        } else {
+          ledEffectActive = false;
+        }
+        break;
+
+      case 8: // 웨이크워드 감지 - 빠른 파란색 깜빡임
+        if (elapsed < 600) {
+          // 150ms 주기로 4번 깜빡임 (150ms on, 150ms off 반복)
+          int blinkCycle = (elapsed / 300) % 2;
+          if (blinkCycle == 0) {
+            // 켜짐 - 파란색
+            int brightness = max(currentBrightness, 255);  // 최소 밝기 보장
+            setAllPixels(0, brightness, 0);
+          } else {
+            // 꺼짐
+            setAllPixels(0, 0, 0);
+          }
+        } else {
+          ledEffectActive = false;
+        }
+        break;
+
+      case 9: // 시작
+        if (elapsed < 600) {
+          // 150ms 주기로 4번 깜빡임 (150ms on, 150ms off 반복)
+          int blinkCycle = (elapsed / 300) % 2;
+          if (blinkCycle == 0) {
+            // 켜짐 - 파란색
+            int brightness = max(currentBrightness, 255);  // 최소 밝기 보장
+            setAllPixels(0, 0, brightness);
+          } else {
+            // 꺼짐
+            setAllPixels(0, 0, 0);
+          }
+        } else {
+          ledEffectActive = false;
+        }
+        break;
+
+      case 10: // 집으로
+        if (elapsed < 600) {
+          // 150ms 주기로 4번 깜빡임 (150ms on, 150ms off 반복)
+          int blinkCycle = (elapsed / 300) % 2;
+          if (blinkCycle == 0) {
+            // 켜짐 - 파란색
+            int brightness = max(currentBrightness, 255);  // 최소 밝기 보장
+            setAllPixels(brightness, brightness, 0);
+          } else {
+            // 꺼짐
+            setAllPixels(0, 0, 0);
+          }
+        } else {
+          ledEffectActive = false;
+        }
+        break;
+
+      case 11: // 정지
+        if (elapsed < 600) {
+          // 150ms 주기로 4번 깜빡임 (150ms on, 150ms off 반복)
+          int blinkCycle = (elapsed / 300) % 2;
+          if (blinkCycle == 0) {
+            // 켜짐 - 파란색
+            int brightness = max(currentBrightness, 255);  // 최소 밝기 보장
+            setAllPixels(brightness, 0, 0);
+          } else {
+            // 꺼짐
+            setAllPixels(0, 0, 0);
+          }
         } else {
           ledEffectActive = false;
         }

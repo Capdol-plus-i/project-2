@@ -1,6 +1,6 @@
 from dynamixel_sdk import *
-PORT  = "/dev/ttyUSB0"   # udev 별칭 썼다면 "/dev/dynamixel"
-BAUD  = 57600            # AX-12A 등 구형은 1000000일 때 많음
+PORT  = "/dev/ttyACM0"   # udev 별칭 썼다면 "/dev/dynamixel"
+BAUD  = 1000000            # AX-12A 등 구형은 1000000일 때 많음
 PROTO = 2.0              # 구형이면 1.0
 p = PortHandler(PORT); pk = PacketHandler(PROTO)
 assert p.openPort() and p.setBaudRate(BAUD), "포트/보레이트 실패"

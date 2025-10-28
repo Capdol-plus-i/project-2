@@ -210,12 +210,12 @@ class VoiceController:
                         if result.is_final or result.stability > 0.8:
                             logger.info(f"✅ 웨이크워드 감지됨: {transcript}")
                             self.voice_status['wake_word_detected'] = True
-                            
-                            # Arduino LED 효과
+
+                            # Arduino LED 효과 - 빠른 파란색 깜빡임으로 시각적 확인
                             from app import arduino_controller
                             if arduino_controller and arduino_controller.is_connected():
-                                arduino_controller.trigger_led_effect(2)  # 파란색 페이드
-                            
+                                arduino_controller.trigger_led_effect(3)  # 웨이크워드 감지 깜빡임
+
                             # 웹 클라이언트에 웨이크워드 감지 알림
                             socketio.emit('voice_wake_word', {
                                 'transcript': transcript,

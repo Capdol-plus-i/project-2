@@ -520,7 +520,7 @@ def load_calibration(filename="calibration.json"):
             calibration_data = json.load(f)
         
         position_offsets = calibration_data.get('position_offsets', {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-        direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1})
+        direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1)
         id_map = calibration_data.get('id_map', {1: 1, 2: 2, 3: 3, 4: 4})
         
         # Convert string keys to int if needed
