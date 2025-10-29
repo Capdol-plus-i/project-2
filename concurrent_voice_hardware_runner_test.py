@@ -493,7 +493,7 @@ class ConcurrentVoiceHardwareRunner:
                 self.arduino = None
         candidate = None
         try:
-            ser = serial.Serial(self.arduino_port, 9600, timeout=1, write_timeout=1)
+            ser = serial.Serial(self.arduino_port, 115200, timeout=1, write_timeout=1)
             time.sleep(2)
             try:
                 ser.reset_input_buffer(); ser.reset_output_buffer()
@@ -987,7 +987,7 @@ class ConcurrentVoiceHardwareRunner:
                         if self.arduino.in_waiting > 0:
                             try:
                                 line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
-                                if line and self.debug: print(f"[Arduino] {line}")
+                                if line: print(f"[Arduino] {line}")
                             except Exception as e:
                                 if self.debug: self.logger.error(f"Arduino read error: {e}")
                 time.sleep(0.01)
