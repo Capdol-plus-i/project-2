@@ -8,6 +8,8 @@ Runs both systems simultaneously:
 - Both systems operate concurrently without interference
 """
 
+# MARK: - Imports & Dependencies
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -62,9 +64,7 @@ try:
 except Exception:
     pass
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# MARK: - Configuration Constants
 
 # Audio settings
 TARGET_RATE = 16000
@@ -96,13 +96,13 @@ COMMAND_SYNONYMS = {
 
     # Hand tracking control
     "TRACKING_ON": ["추적 시작", "시작", "추적 켜", "추적 온", "핸드 트래킹 켜", "손 추적 시작", "트래킹 시작", "트래킹 켜"],
-    "GO_HOME": ["고 홈", "홈", "홈으로", "집으로", "원위치", "제자리", "home"],
+    "GO_HOME": ["고 홈", "홈", "홈으로", "집으로", "원위치", "제자리"],
 
     # Robot position control
-    "STOP": ["스톱", "정지", "멈춰", "stop"],
-    "EMERGENCY_RESET": ["리셋", "복구", "재시작", "긴급복구", "reset", "리셋해줘"],
+    "STOP": ["스톱", "정지", "멈춰", "멈춰줘", "멈춰라"],
+    "EMERGENCY_RESET": ["리셋", "복구", "재시작", "긴급복구", "리셋해줘"],
 
-    "EXIT": ["그만"]
+    "EXIT": ["그만", "종료"]
 }
 
 LED_COMMAND_MAP = {
@@ -121,9 +121,7 @@ LED_COMMAND_MAP = {
 # Robot position constants
 DEFAULT_HOME_POSITION = [2048, 3328, 1140, 3072]
 
-# =============================================================================
-# PYTORCH MODEL CLASSES
-# =============================================================================
+# MARK: - PyTorch Model Classes
 
 class BaseModel(nn.Module):
     """Base class with common weight initialization"""
@@ -223,9 +221,7 @@ class ResFeedforward(BaseModel):
         out = out + residual
         return out
 
-# =============================================================================
-# VOICE RECOGNITION UTILITIES
-# =============================================================================
+# MARK: - Voice Recognition Utilities
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or "")).lower()
@@ -307,9 +303,7 @@ def detect_cmd_interim(text: str) -> Optional[str]:
 
     return None
 
-# =============================================================================
-# MICROPHONE STREAM
-# =============================================================================
+# MARK: - Microphone Stream
 
 def list_input_devices():
     p = pyaudio.PyAudio()
@@ -424,9 +418,7 @@ class MicrophoneStream:
             pcm16k = self._to_mono_16k(chunk)
             yield pcm16k
 
-# =============================================================================
-# GOOGLE SPEECH CLIENT
-# =============================================================================
+# MARK: - Google Speech Client
 
 def build_client_and_config(single_utter: bool):
     client = speech.SpeechClient()
@@ -464,11 +456,10 @@ def start_stream(mic_index: Optional[int], mic_hint: str, debug: bool, for_comma
     responses = client.streaming_recognize(streaming_config, requests)
     return stream, responses
 
-# =============================================================================
-# MAIN CONCURRENT HARDWARE RUNNER
-# =============================================================================
+# MARK: - Main System Class
 
 class ConcurrentVoiceHardwareRunner:
+    # MARK: - Initialization
     def __init__(self, model_path=None, hardware_config_path='hardware_config.json',
                  arduino_port="/dev/arduino", test_mode=False, target_fps=60.0,
                  show_display=False, mic_index=None, mic_hint="blue", debug=False):
@@ -581,6 +572,8 @@ class ConcurrentVoiceHardwareRunner:
         # Initialize Arduino
         self.ensure_arduino_connected(force=True)
 
+    # MARK: - Arduino Management
+
     def ensure_arduino_connected(self, force: bool = False) -> bool:
         """Ensure the Arduino serial connection is open, with optional forced retry."""
         if self.test_mode:
@@ -659,7 +652,8 @@ class ConcurrentVoiceHardwareRunner:
                     self.logger.error(f"❌ Arduino send failed: {e}")
                 return False
 
-    # ----------------- Cache helper -----------------
+    # MARK: - Cache & Helper Methods
+
     def _cache_and_fill(self, camera_name: str, xy: List[float]) -> List[float]:
         """
         xy에 유효값이 있으면 캐시에 저장하고 그대로 반환.
@@ -682,6 +676,8 @@ class ConcurrentVoiceHardwareRunner:
         if np.isfinite(cache['xy']).all() and (self.cache_ttl <= 0.0 or age <= self.cache_ttl):
             return cache['xy']
         return [np.nan, np.nan]
+
+    # MARK: - Model Loading
 
     def load_model(self):
         """Load XGBoost or PyTorch model (same as hardware_runner.py)"""
@@ -787,6 +783,8 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.error(f"Failed to load model: {e}")
             raise
 
+    # MARK: - Hardware Configuration
+
     def load_hardware_config(self, config_path):
         try:
             with open(config_path, 'r') as f:
@@ -807,6 +805,8 @@ class ConcurrentVoiceHardwareRunner:
                     "right": {"id": 2, "width": 640, "height": 480}
                 }
             }
+
+    # MARK: - Camera Setup
 
     def setup_cameras(self):
         """Setup camera system"""
@@ -848,6 +848,8 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.error(f"Failed to setup {camera_name} camera: {e}")
             return None
 
+    # MARK: - MediaPipe Setup
+
     def setup_mediapipe(self):
         """Setup MediaPipe hand tracking"""
         self.mp_hands = mp.solutions.hands
@@ -867,6 +869,8 @@ class ConcurrentVoiceHardwareRunner:
         )
         self.mp_drawing = mp.solutions.drawing_utils
 
+    # MARK: - Display Setup
+
     def setup_display_windows(self):
         """Setup OpenCV display windows"""
         if self.cameras.get('left') is not None:
@@ -878,6 +882,8 @@ class ConcurrentVoiceHardwareRunner:
             cv2.resizeWindow('Right Camera', 640, 480)
             cv2.moveWindow('Right Camera', 780, 100)
         self.logger.info("Display windows initialized - press 'q' to quit")
+
+    # MARK: - Servo Setup
 
     def setup_servo_defaults(self):
         """Setup default servo parameters"""
@@ -980,6 +986,8 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Exception disabling torque for servo {servo_id}: {e}")
 
+    # MARK: - Servo Control
+
     def send_servo_commands(self, positions):
         """Send position commands to servos"""
         if self.test_mode or not DynamixelSDK_available:
@@ -1064,6 +1072,8 @@ class ConcurrentVoiceHardwareRunner:
         clamped = self.clamp_positions(positions)
         return self.send_servo_commands(clamped)
 
+    # MARK: - Camera Threading
+
     def start_camera_threads(self):
         """Start camera capture threads"""
         self.capture_active.set()  # Set event to start capture
@@ -1129,6 +1139,8 @@ class ConcurrentVoiceHardwareRunner:
                 frames[camera_name] = None
         return frames
 
+    # MARK: - Hand Tracking
+
     def extract_hand_features(self, frame, camera_name):
         """Extract hand features from frame (with cache fallback)"""
         if frame is None:
@@ -1177,6 +1189,8 @@ class ConcurrentVoiceHardwareRunner:
             xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
             return xy, frame.copy() if self.show_display else frame
 
+    # MARK: - Prediction
+
     def predict_joint_positions(self, features):
         """Predict joint positions using loaded model"""
         if self.model is None:
@@ -1213,6 +1227,8 @@ class ConcurrentVoiceHardwareRunner:
         except Exception as e:
             self.logger.error(f"Prediction error: {e}")
             return self.last_successful_positions.copy()
+
+    # MARK: - Display Update
 
     def update_display(self, frames, left_features, right_features):
         """Update camera display with concurrent mode indicators"""
@@ -1262,6 +1278,8 @@ class ConcurrentVoiceHardwareRunner:
         if key == ord('q'):
             self.running = False
 
+    # MARK: - Voice Recognition
+
     def _process_speech_stream(
         self,
         description: str,
@@ -1304,7 +1322,7 @@ class ConcurrentVoiceHardwareRunner:
                     stream_ctx.__exit__(None, None, None)
                 except Exception as close_err:
                     self.logger.error(f"Error closing {description} stream: {close_err}")
-
+                    
     def voice_recognition_thread(self):
         """Background thread for continuous voice recognition"""
         print("🎤 Voice recognition thread started")
@@ -1316,8 +1334,8 @@ class ConcurrentVoiceHardwareRunner:
                 if res.alternatives and not res.is_final:
                     text = res.alternatives[0].transcript.strip()
                     if text and detect_wake_interim(text):
-                        # Arduino에 파란색 깜빡임 효과 전송 (웨이크워드 시각적 확인)
-                        self.send_arduino_command("LED_EFFECT:8", quiet=True)
+                        # Arduino에 무지개 효과 전송 (웨이크워드 시각적 확인)
+                        self.send_arduino_command("LED_EFFECT:3", quiet=True)
                         return True
             return False
 
@@ -1393,6 +1411,8 @@ class ConcurrentVoiceHardwareRunner:
 
         print("🔇 Voice recognition thread stopped")
 
+    # MARK: - Arduino Reader Thread
+
     def arduino_reader_thread_func(self):
         """Background thread to continuously read Arduino serial data"""
         print("📖 Arduino reader thread started")
@@ -1414,6 +1434,8 @@ class ConcurrentVoiceHardwareRunner:
                 self.logger.error(f"Arduino reader thread error: {e}")
                 time.sleep(1.0)
         print("📖 Arduino reader thread stopped")
+
+    # MARK: - Command Handling
 
     def handle_voice_command(self, command):
         """Handle recognized voice command"""
@@ -1488,6 +1510,8 @@ class ConcurrentVoiceHardwareRunner:
             else:
                 print(f"⚠️ Arduino not connected, cannot send {arduino_cmd}")
 
+
+    # MARK: - Main Loop
 
     def run_concurrent_loop(self):
         """Main control loop - camera + voice simultaneously"""
@@ -1581,6 +1605,8 @@ class ConcurrentVoiceHardwareRunner:
         finally:
             self.cleanup()
 
+    # MARK: - Cleanup
+
     def cleanup(self):
         """Cleanup all resources"""
         self.logger.info("Cleaning up resources...")
@@ -1658,9 +1684,7 @@ class ConcurrentVoiceHardwareRunner:
 
         self.logger.info("Cleanup completed")
 
-# =============================================================================
-# MAIN FUNCTION
-# =============================================================================
+# MARK: - Entry Point
 
 def main():
     parser = argparse.ArgumentParser(description="Concurrent Voice + Hardware Runner")
