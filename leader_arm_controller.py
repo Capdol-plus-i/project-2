@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unified Leader Arm Controller
-Handles 4x XL330-M077-T motors
+Handles 5x XL330 motors (4x M077-T + 1x M288-T)
 Complete terminal interface for position reading, torque control, and real-time monitoring
 """
 
@@ -45,35 +45,47 @@ PROTOCOL_VERSION = 2.0
 BAUDRATE = hw_config['baudrate']
 DEVICE_NAME = hw_config['port']
 
-# Motor Configuration - All XL330-M288-T
+# Motor Configuration - Mixed XL330 models
 MOTOR_CONFIGS = {
-    # All XL330-M288-T motors (IDs 1, 2, 3, 4)
+    # Motor 1: XL330-M077-T
     1: {
-        'model': 'XL330-M288-T',
+        'model': 'XL330-M077-T',
         'model_number': 1190,
         'position_center': 2048,
         'position_min': 0,
         'position_max': 4095,
         'angle_resolution': 0.088  # degrees per unit
     },
+    # Motor 2: XL330-M288-T
     2: {
         'model': 'XL330-M288-T',
-        'model_number': 1190,
+        'model_number': 1200,
         'position_center': 2048,
         'position_min': 0,
         'position_max': 4095,
         'angle_resolution': 0.088
     },
+    # Motor 3: XL330-M077-T
     3: {
-        'model': 'XL330-M288-T',
+        'model': 'XL330-M077-T',
         'model_number': 1190,
         'position_center': 2048,
         'position_min': 0,
         'position_max': 4095,
         'angle_resolution': 0.088
     },
+    # Motor 4: XL330-M077-T
     4: {
-        'model': 'XL330-M288-T',
+        'model': 'XL330-M077-T',
+        'model_number': 1190,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088
+    },
+    # Motor 5: XL330-M077-T
+    5: {
+        'model': 'XL330-M077-T',
         'model_number': 1190,
         'position_center': 2048,
         'position_min': 0,
@@ -83,15 +95,16 @@ MOTOR_CONFIGS = {
 }
 
 # Control Table Addresses (Protocol 2.0)
+ADDR_OPERATING_MODE = 11
 ADDR_TORQUE_ENABLE = 64
-ADDR_GOAL_POSITION = 116
-ADDR_PRESENT_POSITION = 132
-ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_CURRENT = 126
+ADDR_PRESENT_VELOCITY = 128
+ADDR_PRESENT_POSITION = 132
 ADDR_PRESENT_TEMPERATURE = 146
+ADDR_GOAL_POSITION = 116
 
 # Motor IDs
-MOTOR_IDS = [1, 2, 3, 4]
+MOTOR_IDS = [1, 2, 3, 4, 5]
 
 # Global variables
 port_handler = None
@@ -218,7 +231,7 @@ def read_motor_status(motor_ids=None, show_header=True):
         velocity, comm_result, error = packet_handler.read4ByteTxRx(
             port_handler, motor_id, ADDR_PRESENT_VELOCITY)
         if comm_result == COMM_SUCCESS and error == 0:
-            # XL330-M077-T velocity conversion
+            # XL330 velocity conversion
             rpm = velocity * 0.229 if velocity < 2147483648 else (velocity - 4294967296) * 0.229
             vel_str = f"{rpm:+6.1f} RPM"
         else:
@@ -228,7 +241,7 @@ def read_motor_status(motor_ids=None, show_header=True):
         current, comm_result, error = packet_handler.read2ByteTxRx(
             port_handler, motor_id, ADDR_PRESENT_CURRENT)
         if comm_result == COMM_SUCCESS and error == 0:
-            # XL330-M077-T current conversion
+            # XL330 current conversion
             current_ma = current * 2.69 if current < 32768 else (current - 65536) * 2.69
             current_str = f"{current_ma:+6.1f} mA"
         else:
@@ -284,6 +297,51 @@ def set_all_torque_states(enable):
         print_colored(f"⚠️  {success_count}/{len(connected_motors)} motors torque {'enabled' if enable else 'disabled'}", Colors.WARNING)
 
     return success_count == len(connected_motors)
+
+def set_operating_mode(motor_id, mode):
+    """Set operating mode for a specific motor (must disable torque first)"""
+    if motor_id not in MOTOR_CONFIGS:
+        print_colored(f"❌ Unknown motor ID {motor_id}", Colors.FAIL)
+        return False
+
+    config = MOTOR_CONFIGS[motor_id]
+    mode_names = {3: "Position Control", 4: "Extended Position Control", 16: "PWM Control"}
+    mode_name = mode_names.get(mode, f"Mode {mode}")
+
+    print_colored(f"\n🔧 Setting Motor {motor_id} ({config['model'][:5]}) to {mode_name}...", Colors.CYAN)
+
+    # Step 1: Disable torque (required to change operating mode)
+    comm_result, error = packet_handler.write1ByteTxRx(
+        port_handler, motor_id, ADDR_TORQUE_ENABLE, 0)
+
+    if comm_result != COMM_SUCCESS or error != 0:
+        print_colored(f"  ✗ Failed to disable torque: {packet_handler.getTxRxResult(comm_result)}", Colors.FAIL)
+        return False
+
+    print(f"  ✓ Torque disabled")
+
+    # Step 2: Set operating mode
+    comm_result, error = packet_handler.write1ByteTxRx(
+        port_handler, motor_id, ADDR_OPERATING_MODE, mode)
+
+    if comm_result != COMM_SUCCESS or error != 0:
+        print_colored(f"  ✗ Failed to set operating mode: {packet_handler.getTxRxResult(comm_result)}", Colors.FAIL)
+        return False
+
+    print_colored(f"  ✓ Operating mode set to {mode_name}", Colors.GREEN)
+
+    # Step 3: Re-enable torque
+    #comm_result, error = packet_handler.write1ByteTxRx(
+    #    port_handler, motor_id, ADDR_TORQUE_ENABLE, 1)
+
+    #if comm_result != COMM_SUCCESS or error != 0:
+    #    print_colored(f"  ✗ Failed to re-enable torque: {packet_handler.getTxRxResult(comm_result)}", Colors.FAIL)
+    #    return False
+
+    #print_colored(f"  ✓ Torque re-enabled", Colors.GREEN)
+    #print_colored(f"✅ Motor {motor_id} configured successfully", Colors.GREEN)
+
+    return True
 
 def validate_position(motor_id, position):
     """Validate if position is within safe range for specific motor"""
@@ -443,7 +501,7 @@ def real_time_monitor():
 
             for motor_id in connected_motors:
                 config = MOTOR_CONFIGS[motor_id]
-                type_abbr = "288" if "M288" in config['model'] else "330"
+                type_abbr = "288" if "M288" in config['model'] else "077"
 
                 if motor_id in current_positions:
                     pos_data = current_positions[motor_id]
@@ -492,8 +550,8 @@ def show_help():
     print_colored("\n⚡ Torque Control:", Colors.CYAN)
     print("  'e' or 'enable'     - Enable torque for all motors")
     print("  'd' or 'disable'    - Disable torque for all motors")
-    print("  'e1', 'e2', etc     - Enable torque for specific motor")
-    print("  'd1', 'd2', etc     - Disable torque for specific motor")
+    print("  'e1'-'e5'           - Enable torque for specific motor (e.g., e1, e5)")
+    print("  'd1'-'d5'           - Disable torque for specific motor (e.g., d1, d5)")
     
     print_colored("\n🎯 Position Control:", Colors.CYAN)
     print("  'center'             - Move all motors to center position (0°)")
@@ -509,7 +567,8 @@ def show_help():
     print("  'q' or 'quit'       - Quit controller")
     print_colored("=" * 70, Colors.HEADER)
     print_colored("💡 Motor Types:", Colors.WARNING)
-    print("  - All motors 1-4: XL330-M288-T")
+    print("  - Motors 1,3,4,5: XL330-M077-T")
+    print("  - Motor 2: XL330-M288-T")
     print("  - All motors: Center=2048 (0°), Range=0-4095 (≈±180°)")
     print("  - Motors must have torque enabled to move")
 
@@ -532,12 +591,12 @@ def main():
     
     # Header
     clear_screen()
-    print_colored("🦾 Leader Arm Controller (All XL330-M288-T)", Colors.HEADER + Colors.BOLD)
+    print_colored("🦾 Leader Arm Controller (5x XL330 Motors)", Colors.HEADER + Colors.BOLD)
     print_colored("=" * 70, Colors.HEADER)
     print(f"Device: {DEVICE_NAME}")
     print(f"Baudrate: {BAUDRATE}")
     print(f"Expected Motors: {MOTOR_IDS}")
-    print(f"Motor Types: All XL330-M288-T (1,2,3,4)")
+    print(f"Motor Types: M077-T (1,3,4,5) + M288-T (2)")
     print_colored("=" * 70, Colors.HEADER)
     
     # Initialize
@@ -548,7 +607,11 @@ def main():
     if not ping_motors():
         print_colored("❌ No motors found. Exiting.", Colors.FAIL)
         return
-    
+
+    # Configure motor 5 to position control mode if connected
+    if 5 in connected_motors:
+        set_operating_mode(5, 3)
+
     # Initial status
     read_motor_status()
     
@@ -571,7 +634,7 @@ def main():
                 
             elif cmd in ['c', 'clear']:
                 clear_screen()
-                print_colored("🦾 Leader Arm Controller (All XL330-M288-T)", Colors.HEADER + Colors.BOLD)
+                print_colored("🦾 Leader Arm Controller (5x XL330 Motors)", Colors.HEADER + Colors.BOLD)
                 
             elif cmd in ['s', 'status']:
                 read_motor_status()

@@ -8,8 +8,6 @@ Runs both systems simultaneously:
 - Both systems operate concurrently without interference
 """
 
-# MARK: - Imports & Dependencies
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -18,11 +16,15 @@ import time
 import json
 import argparse
 import logging
+from datetime import datetime
 import mediapipe as mp
+from sklearn.preprocessing import StandardScaler
+import sys
 import os
+import subprocess
+import platform
 import threading
 from queue import Queue, Empty
-from concurrent.futures import ThreadPoolExecutor
 import joblib
 import re
 import unicodedata
@@ -31,7 +33,7 @@ import audioop
 import ctypes
 import ctypes.util
 import struct
-from typing import Optional, List, Tuple, Sequence, Callable
+from typing import Optional, List, Tuple, Sequence
 
 # Hardware imports
 try:
@@ -47,6 +49,14 @@ import serial
 import pyaudio
 import webrtcvad
 from google.cloud import speech
+
+# Jetson optimization imports
+try:
+    import tensorrt as trt
+    import torch_tensorrt
+    TENSORRT_AVAILABLE = True
+except ImportError:
+    TENSORRT_AVAILABLE = False
 
 # Suppress audio/logging noise
 os.environ["GRPC_VERBOSITY"] = "NONE"
@@ -64,7 +74,9 @@ try:
 except Exception:
     pass
 
-# MARK: - Configuration Constants
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
 # Audio settings
 TARGET_RATE = 16000
@@ -85,56 +97,24 @@ COMMAND_SYNONYMS = {
     # Arduino LED control
     "LED_OFF": ["꺼", "꺼줘", "불꺼", "불 꺼", "라이트오프", "라이트 오프", "끄자"],
     "LED_ON": ["켜", "켜줘", "불켜", "불 켜", "라이트온", "라이트 온", "키자"],
-    "LED_BRIGHTER": ["밝게", "밝게해", "밝기 업", "더 밝게", "브라이트업"],
-    "LED_DIMMER": ["어둡게", "어둡게해", "밝기 다운", "더 어둡게", "브라이트다운"],
-    "LED_RED": ["빨간불", "빨간색", "빨강", "레드"],
-    "LED_GREEN": ["초록불", "초록색", "초록", "그린"],
-    "LED_BLUE": ["파란불", "파란색", "파랑", "블루"],
-    "LED_YELLOW": ["노란불", "노란색", "노랑", "옐로우"],
-    "LED_WHITE": ["하얀불", "하얀색", "흰색", "화이트"],
-    "LED_RAINBOW": ["무지개", "무지개 불", "레인보우"],
 
     # Hand tracking control
     "TRACKING_ON": ["추적 시작", "시작", "추적 켜", "추적 온", "핸드 트래킹 켜", "손 추적 시작", "트래킹 시작", "트래킹 켜"],
-    "GO_HOME": ["고 홈", "홈", "홈으로", "집으로", "원위치", "제자리"],
+    "GO_HOME": ["고 홈", "홈", "홈으로", "집으로", "원위치", "제자리", "home"],
 
     # Robot position control
-    "STOP": ["스톱", "정지", "멈춰", "멈춰줘", "멈춰라"],
-    "EMERGENCY_RESET": ["리셋", "복구", "재시작", "긴급복구", "리셋해줘"],
+    "STOP": ["스톱", "정지", "멈춰", "stop"],
 
     "EXIT": ["그만"]
 }
 
-LED_COMMAND_MAP = {
-    "LED_ON": "ON",
-    "LED_OFF": "OFF",
-    "LED_BRIGHTER": "UP",
-    "LED_DIMMER": "DOWN",
-    "LED_RED": "RED",
-    "LED_GREEN": "GREEN",
-    "LED_BLUE": "BLUE",
-    "LED_YELLOW": "YELLOW",
-    "LED_WHITE": "WHITE",
-    "LED_RAINBOW": "RAINBOW",
-}
+# =============================================================================
+# PYTORCH MODEL CLASSES
+# =============================================================================
 
-# Robot position constants
-DEFAULT_HOME_POSITION = [2048, 3328, 1140, 1600, 2048]
-
-# MARK: - PyTorch Model Classes
-
-class BaseModel(nn.Module):
-    """Base class with common weight initialization"""
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-class SimpleTransformer(BaseModel):
+class SimpleTransformer(nn.Module):
     """Ultra-simple neural network for regression"""
-    def __init__(self, input_dim=4, output_dim=5, d_model=8, nhead=1,
+    def __init__(self, input_dim=4, output_dim=4, d_model=8, nhead=1,
                  num_layers=1, dim_feedforward=12, dropout=0.0):
         super().__init__()
         self.network = nn.Sequential(
@@ -144,17 +124,24 @@ class SimpleTransformer(BaseModel):
         )
         self._init_weights()
 
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, x):
         return self.network(x)
 
 
-class ConfigurableFeedforward(BaseModel):
+class ConfigurableFeedforward(nn.Module):
     """Feedforward network that mirrors training-time architecture."""
 
     def __init__(
         self,
         input_dim: int = 4,
-        output_dim: int = 5,
+        output_dim: int = 4,
         hidden_sizes: Sequence[int] | None = None,
         dropout: float = 0.0,
     ) -> None:
@@ -178,11 +165,18 @@ class ConfigurableFeedforward(BaseModel):
         self.network = nn.Sequential(*layers)
         self._init_weights()
 
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
 
 
-class ResidualBlock(BaseModel):
+class ResidualBlock(nn.Module):
     """Residual block with feedforward layers"""
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.0):
         super().__init__()
@@ -192,7 +186,6 @@ class ResidualBlock(BaseModel):
         self.proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
         self.norm = nn.LayerNorm(output_dim)
         self.drop = nn.Dropout(dropout)
-        self._init_weights()
 
     def forward(self, x):
         residual = self.proj(x)
@@ -205,29 +198,24 @@ class ResidualBlock(BaseModel):
         return out
 
 
-class ResFeedforward(BaseModel):
+class ResFeedforward(nn.Module):
     """Residual feedforward network"""
-    def __init__(self, input_dim=4, output_dim=5, dropout=0.0):
+    def __init__(self, input_dim=4, output_dim=4, dropout=0.0):
         super().__init__()
-        self.fc_in = nn.Linear(input_dim, 8)
-        self.act = nn.ReLU()
-        self.block_a = ResidualBlock(8, 16, 32, dropout)
-        self.block_b = ResidualBlock(32, 16, 8, dropout)
-        self.fc_out = nn.Linear(8, output_dim)
+        self.block_a = ResidualBlock(input_dim, 8, 16, dropout)
+        self.block_b = ResidualBlock(16, 8, output_dim, dropout)
         self.long_skip = nn.Linear(input_dim, output_dim)
-        self._init_weights()
 
     def forward(self, x):
         residual = self.long_skip(x)
-        out = self.fc_in(x)
-        out = self.act(out)
-        out = self.block_a(out)
+        out = self.block_a(x)
         out = self.block_b(out)
-        out = self.fc_out(out)
         out = out + residual
         return out
 
-# MARK: - Voice Recognition Utilities
+# =============================================================================
+# VOICE RECOGNITION UTILITIES
+# =============================================================================
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text or "")).lower()
@@ -291,26 +279,33 @@ def detect_wake_interim(text: str) -> bool:
     return quick_contains(text, keys)
 
 def detect_cmd_interim(text: str) -> Optional[str]:
-    """Detect command in interim results (priority order)"""
-    # Special case: check longer phrases first for TRACKING_ON
+    # Priority order: EXIT → Robot control → Hand tracking control → Arduino commands
+    if quick_contains(text, COMMAND_SYNONYMS["EXIT"]):
+        return "EXIT"
+
+    # Robot position control
+    if quick_contains(text, COMMAND_SYNONYMS["STOP"]):
+        return "STOP"
+    if quick_contains(text, COMMAND_SYNONYMS["GO_HOME"]):
+        return "GO_HOME"
+
+    # Hand tracking control - check longer phrases first
     if quick_contains(text, ["추적 시작", "트래킹 시작"]):
         return "TRACKING_ON"
+    if quick_contains(text, COMMAND_SYNONYMS["TRACKING_ON"]):
+        return "TRACKING_ON"
 
-    # Check commands in priority order
-    priority_commands = [
-        "EXIT", "EMERGENCY_RESET", "STOP", "GO_HOME",
-        "TRACKING_ON",
-        "LED_OFF", "LED_ON", "LED_BRIGHTER", "LED_DIMMER",
-        "LED_RED", "LED_GREEN", "LED_BLUE", "LED_YELLOW", "LED_WHITE", "LED_RAINBOW"
-    ]
-
-    for cmd in priority_commands:
-        if quick_contains(text, COMMAND_SYNONYMS[cmd]):
-            return cmd
+    # Arduino LED commands
+    if quick_contains(text, COMMAND_SYNONYMS["LED_OFF"]):
+        return "LED_OFF"
+    if quick_contains(text, COMMAND_SYNONYMS["LED_ON"]):
+        return "LED_ON"
 
     return None
 
-# MARK: - Microphone Stream
+# =============================================================================
+# MICROPHONE STREAM
+# =============================================================================
 
 def list_input_devices():
     p = pyaudio.PyAudio()
@@ -423,9 +418,17 @@ class MicrophoneStream:
             if chunk is None:
                 return
             pcm16k = self._to_mono_16k(chunk)
+            if self.debug:
+                try:
+                    voiced = self.vad.is_speech(pcm16k[:FRAME_BYTES], TARGET_RATE)
+                    print(f"\r[VAD] {'speech' if voiced else 'silence'}", end="", flush=True)
+                except:
+                    pass
             yield pcm16k
 
-# MARK: - Google Speech Client
+# =============================================================================
+# GOOGLE SPEECH CLIENT
+# =============================================================================
 
 def build_client_and_config(single_utter: bool):
     client = speech.SpeechClient()
@@ -463,12 +466,35 @@ def start_stream(mic_index: Optional[int], mic_hint: str, debug: bool, for_comma
     responses = client.streaming_recognize(streaming_config, requests)
     return stream, responses
 
-# MARK: - Main System Class
+# =============================================================================
+# ARDUINO INTERFACE
+# =============================================================================
+
+def open_arduino(port: str, baud: int = 9600):
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)
+        print(f"✓ Arduino 연결 성공! ({port})")
+        return ser
+    except Exception as e:
+        print(f"❌ Arduino 연결 실패: {e}")
+        return None
+
+def send_arduino(ser, cmd: str):
+    try:
+        ser.write((cmd + "\n").encode())
+        ser.flush()
+        print(f"👉 Arduino: {cmd}")
+    except Exception as e:
+        print(f"❌ Arduino 전송 실패: {e}")
+
+# =============================================================================
+# MAIN CONCURRENT HARDWARE RUNNER
+# =============================================================================
 
 class ConcurrentVoiceHardwareRunner:
-    # MARK: - Initialization
     def __init__(self, model_path=None, hardware_config_path='hardware_config.json',
-                 arduino_port="/dev/arduino", test_mode=False, target_fps=30.0,
+                 arduino_port="/dev/arduino", test_mode=False, target_fps=60.0,
                  show_display=False, mic_index=None, mic_hint="blue", debug=False):
 
         # System control flags
@@ -476,10 +502,6 @@ class ConcurrentVoiceHardwareRunner:
         self.voice_active = True           # Voice recognition system
         self.running = True
         self.robot_stopped = False         # Robot frozen at current position
-
-        # MediaPipe performance optimization - frame skipping
-        self.mediapipe_process_every_n_frames = 2  # Process MediaPipe every N frames
-        self.mediapipe_frame_counters = {'left': 0, 'right': 0}  # Per-camera frame counters
 
         # Hardware runner setup
         self.model_path = model_path
@@ -495,18 +517,6 @@ class ConcurrentVoiceHardwareRunner:
         self.debug = debug
         self.arduino = None
         self.voice_thread = None
-        self.arduino_reader_thread = None
-        self.arduino_reader_active = False
-        self._arduino_lock = threading.Lock()
-        self._last_arduino_attempt = 0.0
-        self._arduino_retry_interval = 5.0
-        self._last_arduino_ping = 0.0
-        self._arduino_keepalive_interval = 3.0
-
-        # Thread synchronization locks
-        self._frame_queue_lock = threading.RLock()  # For frame_queues dictionary access
-        self._robot_state_lock = threading.RLock()  # For robot state flags
-        self._mediapipe_lock = threading.RLock()    # For MediaPipe model calls 
 
         # Setup logging
         logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
@@ -537,8 +547,9 @@ class ConcurrentVoiceHardwareRunner:
         # Initialize camera system
         self.frame_queues = {}
         self.camera_threads = {}
-        self.capture_active = threading.Event()  # Thread-safe flag for camera capture
+        self.capture_active = False
         self.cameras = {}
+        self.camera_color_converters = {}
 
         self.setup_cameras()
         self.setup_mediapipe()
@@ -553,142 +564,23 @@ class ConcurrentVoiceHardwareRunner:
             self.setup_servo_defaults()
 
         # Safety and control variables
+        self.frame_count = 0
+        self.total_inference_time = 0.0
+        self.last_fps_time = time.time()
         self.consecutive_failures = 0
         self.max_consecutive_failures = 10
-        self.last_successful_positions = DEFAULT_HOME_POSITION.copy()
-        self.position_smoothing_alpha = 0.2
-
-
-        self.last_positions = DEFAULT_HOME_POSITION.copy()
+        self.last_successful_positions = [2048, 3328, 1140, 3072]
+        self.position_smoothing_alpha = 0.3
+        self.last_positions = [2048, 3328, 1140, 3072]
         self.emergency_stop = False
-        self.safe_zone_min = [1024, 1900, 1024, 1024, 512]
-        self.safe_zone_max = [2944, 3520, 3340, 3136, 4096]
+        self.safe_zone_min = [1280, 1920, 1120, 1664]
+        self.safe_zone_max = [2944, 3456, 3200, 3136]
 
         # Safe holding position when tracking is disabled
-        self.safe_holding_position = DEFAULT_HOME_POSITION.copy()
-
-        # Track last sent positions to avoid duplicate commands
-        self.last_sent_positions = None
-
-        # Hand coordinate cache (per camera) - TTL: 0.5s
-        self.cache_ttl = 0.0
-        self.coord_cache = {
-            'left':  {'xy': [np.nan, np.nan], 't': 0.0},
-            'right': {'xy': [np.nan, np.nan], 't': 0.0},
-        }
-
-        # ThreadPoolExecutor for parallel hand tracking
-        self.hand_tracking_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hand_track")
+        self.safe_holding_position = [2048, 3328, 1140, 3072]
 
         # Initialize Arduino
-        self.ensure_arduino_connected(force=True)
-
-    # MARK: - Arduino Management
-
-    def ensure_arduino_connected(self, force: bool = False) -> bool:
-        """Ensure the Arduino serial connection is open, with optional forced retry."""
-        if self.test_mode:
-            return False
-
-        with self._arduino_lock:
-            if self.arduino and getattr(self.arduino, "is_open", False):
-                return True
-
-            now = time.time()
-            if not force and (now - self._last_arduino_attempt) < self._arduino_retry_interval:
-                return False
-
-            self._last_arduino_attempt = now
-
-            if self.arduino:
-                try:
-                    self.arduino.close()
-                except Exception:
-                    pass
-                self.arduino = None
-
-        # Open Arduino connection (integrated from open_arduino function)
-        candidate = None
-        try:
-            ser = serial.Serial(self.arduino_port, 9600, timeout=1, write_timeout=1)
-            time.sleep(2)
-            try:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-            except Exception:
-                pass  # Some platforms don't support buffer reset
-            self.logger.info(f"✓ Arduino connected ({self.arduino_port})")
-            candidate = ser
-        except Exception as e:
-            self.logger.error(f"❌ Arduino connection failed: {e}")
-            candidate = None
-
-        with self._arduino_lock:
-            if candidate and getattr(candidate, "is_open", False):
-                self.arduino = candidate
-                self._last_arduino_ping = time.time()
-                return True
-
-            self.arduino = None
-            self._last_arduino_ping = 0.0
-            return False
-
-    def _mark_arduino_disconnected(self) -> None:
-        """Close and clear Arduino connection state."""
-        with self._arduino_lock:
-            if self.arduino:
-                try:
-                    self.arduino.close()
-                except Exception:
-                    pass
-            self.arduino = None
-            self._last_arduino_attempt = 0.0
-            self._last_arduino_ping = 0.0
-
-    def send_arduino_command(self, cmd: str, quiet: bool = False) -> bool:
-        """Send command to Arduino (integrated method)"""
-        with self._arduino_lock:
-            if not self.arduino or not getattr(self.arduino, "is_open", False):
-                if not quiet:
-                    self.logger.info(f"❌ Arduino not connected")
-                return False
-            try:
-                self.arduino.write((cmd + "\n").encode())
-                self.arduino.flush()
-                if not quiet:
-                    self.logger.info(f"👉 Arduino: {cmd}")
-                return True
-            except Exception as e:
-                if not quiet:
-                    self.logger.error(f"❌ Arduino send failed: {e}")
-                return False
-
-    # MARK: - Cache & Helper Methods
-
-    def _cache_and_fill(self, camera_name: str, xy: List[float]) -> List[float]:
-        """
-        xy에 유효값이 있으면 캐시에 저장하고 그대로 반환.
-        NaN이면 캐시에 든 값을 (TTL 이내라면) 반환, 없으면 [nan, nan].
-        """
-        now = time.time()
-        cache = self.coord_cache.get(camera_name)
-        if cache is None:
-            cache = {'xy': [np.nan, np.nan], 't': 0.0}
-            self.coord_cache[camera_name] = cache
-
-        arr = np.asarray(xy, dtype=np.float32)
-        if np.isfinite(arr).all():
-            cache['xy'] = [float(arr[0]), float(arr[1])]
-            cache['t'] = now
-            return cache['xy']
-
-        # 결측: 캐시 사용 (TTL==0 이면 무제한)
-        age = now - cache['t']
-        if np.isfinite(cache['xy']).all() and (self.cache_ttl <= 0.0 or age <= self.cache_ttl):
-            return cache['xy']
-        return [np.nan, np.nan]
-
-    # MARK: - Model Loading
+        self.arduino = open_arduino(self.arduino_port)
 
     def load_model(self):
         """Load XGBoost or PyTorch model (same as hardware_runner.py)"""
@@ -728,7 +620,7 @@ class ConcurrentVoiceHardwareRunner:
                     # Legacy 2-layer feedforward
                     self.model = SimpleTransformer(
                         input_dim=4,
-                        output_dim=5,
+                        output_dim=4,
                         d_model=config.get('d_model', config.get('dim_feedforward', 12)),
                         nhead=config.get('nhead', 1),
                         num_layers=1,
@@ -747,7 +639,7 @@ class ConcurrentVoiceHardwareRunner:
                     dropout = float(config.get('dropout', 0.0))
                     self.model = ConfigurableFeedforward(
                         input_dim=4,
-                        output_dim=5,
+                        output_dim=4,
                         hidden_sizes=hidden_sizes,
                         dropout=dropout
                     ).to(self.device)
@@ -761,7 +653,7 @@ class ConcurrentVoiceHardwareRunner:
                 # Residual feedforward model
                 self.model = ResFeedforward(
                     input_dim=4,
-                    output_dim=5,
+                    output_dim=4,
                     dropout=config.get('dropout', 0.0)
                 ).to(self.device)
                 self.logger.info(f"Created ResFeedforward model: {arch}")
@@ -770,7 +662,7 @@ class ConcurrentVoiceHardwareRunner:
                 # Default transformer model
                 self.model = SimpleTransformer(
                     input_dim=4,
-                    output_dim=5,
+                    output_dim=4,
                     d_model=config.get('d_model', 8),
                     nhead=config.get('nhead', 1),
                     num_layers=config.get('num_layers', 1),
@@ -794,8 +686,6 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.error(f"Failed to load model: {e}")
             raise
 
-    # MARK: - Hardware Configuration
-
     def load_hardware_config(self, config_path):
         try:
             with open(config_path, 'r') as f:
@@ -803,24 +693,35 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.info(f"Hardware config loaded: {config_path}")
         except FileNotFoundError:
             self.logger.warning(f"Hardware config not found: {config_path}, using defaults")
-
-    # MARK: - Camera Setup
+            self.config = {
+                "servos": {
+                    "port": "/dev/ttyUSB0",
+                    "baudrate": 1000000,
+                    "ids": [1, 2, 3, 4],
+                    "min_positions": [1280, 1920, 1120, 1664],
+                    "max_positions": [2944, 3456, 3200, 3136]
+                },
+                "cameras": {
+                    "left": {"id": 0, "width": 640, "height": 480},
+                    "right": {"id": 2, "width": 640, "height": 480}
+                }
+            }
 
     def setup_cameras(self):
         """Setup camera system"""
         self.cameras = {}
         camera_config = self.config.get('cameras', {})
 
-        left_config = camera_config.get('cam_left', {'id': '/dev/cam_left', 'enabled': True})
+        left_config = camera_config.get('cam_left', {'id': 0, 'enabled': True})
         if left_config.get('enabled', True):
-            left_id = left_config.get('id', '/dev/cam_left')
+            left_id = left_config.get('id', 0)
             self.cameras['left'] = self._setup_single_camera('left', left_id, left_config)
         else:
             self.cameras['left'] = None
 
-        right_config = camera_config.get('cam_right', {'id': '/dev/cam_right', 'enabled': True})
+        right_config = camera_config.get('cam_right', {'id': 2, 'enabled': True})
         if right_config.get('enabled', True):
-            right_id = right_config.get('id', '/dev/cam_right')
+            right_id = right_config.get('id', 2)
             self.cameras['right'] = self._setup_single_camera('right', right_id, right_config)
         else:
             self.cameras['right'] = None
@@ -836,7 +737,6 @@ class ConcurrentVoiceHardwareRunner:
                 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 camera.set(cv2.CAP_PROP_FPS, 30)
-                #camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 self.logger.info(f"{camera_name.title()} camera ready (id={camera_id})")
                 return camera
@@ -847,28 +747,24 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.error(f"Failed to setup {camera_name} camera: {e}")
             return None
 
-    # MARK: - MediaPipe Setup
-
     def setup_mediapipe(self):
         """Setup MediaPipe hand tracking"""
         self.mp_hands = mp.solutions.hands
         self.hands_left = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.4,
+            min_detection_confidence=0.2,
             min_tracking_confidence=0.2,
             model_complexity=0
         )
         self.hands_right = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.4,
+            min_detection_confidence=0.2,
             min_tracking_confidence=0.2,
             model_complexity=0
         )
         self.mp_drawing = mp.solutions.drawing_utils
-
-    # MARK: - Display Setup
 
     def setup_display_windows(self):
         """Setup OpenCV display windows"""
@@ -882,14 +778,12 @@ class ConcurrentVoiceHardwareRunner:
             cv2.moveWindow('Right Camera', 780, 100)
         self.logger.info("Display windows initialized - press 'q' to quit")
 
-    # MARK: - Servo Setup
-
     def setup_servo_defaults(self):
         """Setup default servo parameters"""
         robot_config = self.config.get('robot_arms', {})
-        self.servo_ids = robot_config.get('motor_ids', [1, 2, 3, 4, 5])
-        self.min_positions = [1024, 1900, 1024, 1024, 512]
-        self.max_positions = [2944, 3520, 3340, 3136, 4096]
+        self.servo_ids = robot_config.get('motor_ids', [1, 2, 3, 4])
+        self.min_positions = [1024, 1024, 1024, 1024]
+        self.max_positions = [2944, 3456, 3200, 3136]
 
     def setup_servos(self):
         """Setup servo communication"""
@@ -911,38 +805,12 @@ class ConcurrentVoiceHardwareRunner:
         if not self.port_handler.setBaudRate(baudrate):
             raise Exception(f"Failed to set baudrate {baudrate}")
 
-        self.servo_ids = robot_config.get('motor_ids', [1, 2, 3, 4, 5])
-        self.min_positions = [1024, 1900, 1024, 1024, 512]
-        self.max_positions = [2944, 3520, 3340, 3136, 4096]
+        self.servo_ids = robot_config.get('motor_ids', [1, 2, 3, 4])
+        self.min_positions = [1280, 1920, 1120, 1664]
+        self.max_positions = [3072, 3072, 3072, 3072]
 
         goal_position_addr = robot_config.get('addr_goal_position', 116)
         self.group_sync_write = GroupSyncWrite(self.port_handler, self.packet_handler, goal_position_addr, 4)
-
-        # Set Position P Gain for all motors from config file
-        position_p_gain_addr = 84
-        p_gain_values = follower_config.get('position_p_gains', [])
-
-        if p_gain_values:
-            if len(p_gain_values) != len(self.servo_ids):
-                self.logger.warning(f"Position P Gain array length ({len(p_gain_values)}) doesn't match motor count ({len(self.servo_ids)})")
-
-            for i, servo_id in enumerate(self.servo_ids):
-                if i < len(p_gain_values):
-                    p_gain_value = int(p_gain_values[i])
-                    try:
-                        dxl_comm_result, dxl_error = self.packet_handler.write2ByteTxRx(
-                            self.port_handler, servo_id, position_p_gain_addr, p_gain_value
-                        )
-                        if dxl_comm_result != COMM_SUCCESS:
-                            self.logger.warning(f"Failed to set Position P Gain for motor {servo_id}: Communication error")
-                        elif dxl_error != 0:
-                            self.logger.warning(f"Failed to set Position P Gain for motor {servo_id}: Error code {dxl_error}")
-                        else:
-                            self.logger.info(f"Position P Gain set to {p_gain_value} for motor {servo_id} (address {position_p_gain_addr})")
-                    except Exception as e:
-                        self.logger.error(f"Exception while setting Position P Gain for motor {servo_id}: {e}")
-        else:
-            self.logger.info("No Position P Gain values configured - using motor defaults")
 
         self.enable_torque()
         self.logger.info(f"Servos initialized on {port}")
@@ -985,8 +853,6 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Exception disabling torque for servo {servo_id}: {e}")
 
-    # MARK: - Servo Control
-
     def send_servo_commands(self, positions):
         """Send position commands to servos"""
         if self.test_mode or not DynamixelSDK_available:
@@ -996,18 +862,17 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.warning("Emergency stop active - not sending commands")
             return False
 
-        # Skip if positions haven't changed (within 1 unit tolerance)
-        if self.last_sent_positions is not None:
-            positions_changed = False
-            for i, pos in enumerate(positions):
-                if i >= len(self.last_sent_positions) or abs(pos - self.last_sent_positions[i]) > 1:
-                    positions_changed = True
-                    break
-            if not positions_changed:
-                return True
-
         try:
-            # Note: Safety check is performed in clamp_positions() before calling this method
+            # Safety check
+            for i, pos in enumerate(positions):
+                min_safe = self.safe_zone_min[i] if i < len(self.safe_zone_min) else 1200
+                max_safe = self.safe_zone_max[i] if i < len(self.safe_zone_max) else 2896
+
+                if pos < min_safe or pos > max_safe:
+                    self.logger.error(f"Refusing unsafe position {pos} for joint {i}")
+                    self.emergency_stop = True
+                    return False
+
             # Clear and add parameters
             self.group_sync_write.clearParam()
 
@@ -1028,7 +893,6 @@ class ConcurrentVoiceHardwareRunner:
 
             if success:
                 self.last_successful_positions = positions.copy()
-                self.last_sent_positions = positions.copy()  # Track for duplicate prevention
                 self.consecutive_failures = 0
             else:
                 self.consecutive_failures += 1
@@ -1063,23 +927,15 @@ class ConcurrentVoiceHardwareRunner:
 
             safe_positions.append(safe_pos)
 
-        self.last_positions = safe_positions
+        self.last_positions = safe_positions.copy()
         return safe_positions
-
-    def move_to_position(self, positions):
-        """Clamp positions and send to servos (helper method)"""
-        clamped = self.clamp_positions(positions)
-        return self.send_servo_commands(clamped)
-
-    # MARK: - Camera Threading
 
     def start_camera_threads(self):
         """Start camera capture threads"""
-        self.capture_active.set()  # Set event to start capture
+        self.capture_active = True
         for camera_name, camera in self.cameras.items():
             if camera is not None:
-                with self._frame_queue_lock:
-                    self.frame_queues[camera_name] = Queue(maxsize=10)
+                self.frame_queues[camera_name] = Queue(maxsize=2)
                 thread = threading.Thread(
                     target=self._camera_capture_thread,
                     args=(camera_name, camera),
@@ -1090,32 +946,26 @@ class ConcurrentVoiceHardwareRunner:
 
     def _camera_capture_thread(self, camera_name, camera):
         """Camera capture thread"""
-        while self.capture_active.is_set():
+        while self.capture_active:
             try:
                 ret, frame = camera.read()
                 if ret:
-                    with self._frame_queue_lock:
+                    try:
+                        self.frame_queues[camera_name].put_nowait(frame)
+                    except:
                         try:
+                            self.frame_queues[camera_name].get_nowait()
                             self.frame_queues[camera_name].put_nowait(frame)
-                        except queue.Full:
-                            # Queue is full, drop oldest frame and add new one
-                            try:
-                                self.frame_queues[camera_name].get_nowait()
-                                self.frame_queues[camera_name].put_nowait(frame)
-                            except Empty:
-                                pass
-                        except KeyError as e:
-                            self.logger.error(f"[{camera_name}] Queue KeyError: {e}")
-                            break
-
-                time.sleep(0.001)
+                        except Empty:
+                            pass
+                time.sleep(0.01)
             except Exception as e:
                 self.logger.error(f"Camera {camera_name} error: {e}")
                 break
 
     def stop_camera_threads(self):
         """Stop camera capture threads"""
-        self.capture_active.clear()  # Clear event to stop capture
+        self.capture_active = False
         for camera_name, thread in self.camera_threads.items():
             thread.join(timeout=1.0)
         self.camera_threads.clear()
@@ -1126,79 +976,48 @@ class ConcurrentVoiceHardwareRunner:
         for camera_name in self.cameras.keys():
             try:
                 frame = None
-                with self._frame_queue_lock:
-                    while True:
-                        try:
-                            frame = self.frame_queues[camera_name].get_nowait()
-                        except Empty:
-                            break
-
+                while True:
+                    try:
+                        frame = self.frame_queues[camera_name].get_nowait()
+                    except Empty:
+                        break
                 frames[camera_name] = frame
             except KeyError:
                 frames[camera_name] = None
         return frames
 
-    # MARK: - Hand Tracking
-
     def extract_hand_features(self, frame, camera_name):
-        """Extract hand features from frame (with cache fallback and frame skipping optimization)"""
+        """Extract hand features from frame"""
         if frame is None:
-            # 프레임 자체가 없을 때도 캐시로 대체
-            xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
-            return xy, None
+            return [np.nan, np.nan], None
 
         try:
             if frame.size == 0 or len(frame.shape) != 3:
-                xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
-                return xy, frame.copy()
+                return [np.nan, np.nan], frame.copy()
 
-            # Frame skipping optimization: only process MediaPipe every N frames
-            self.mediapipe_frame_counters[camera_name] += 1
-            should_process_mediapipe = (self.mediapipe_frame_counters[camera_name] %
-                                       self.mediapipe_process_every_n_frames == 0)
-
+            hands_processor = self.hands_left if camera_name == 'left' else self.hands_right
+            frame.flags.writeable = False
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands_processor.process(rgb_frame)
             frame.flags.writeable = True
-            # Only copy frame if display is enabled, otherwise use reference
-            display_frame = frame.copy() if self.show_display else frame
+            display_frame = frame.copy()
 
-            raw_xy = [np.nan, np.nan]
+            if results.multi_hand_landmarks:
+                hand_landmarks = results.multi_hand_landmarks[0]
+                self.mp_drawing.draw_landmarks(display_frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                index_tip = hand_landmarks.landmark[8]
+                if 0 <= index_tip.x <= 1 and 0 <= index_tip.y <= 1:
+                    h, w = frame.shape[:2]
+                    x = index_tip.x * w
+                    y = index_tip.y * h
+                    if 0 <= x <= w and 0 <= y <= h:
+                        return [float(x), float(y)], display_frame
 
-            if should_process_mediapipe:
-                # Process MediaPipe on this frame
-                hands_processor = self.hands_left if camera_name == 'left' else self.hands_right
-                frame.flags.writeable = False
-                # Use cv2.cvtColor for faster BGR→RGB conversion (IPP/SIMD optimized: 2-3x faster)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                # MediaPipe models are thread-safe (separate instances for left/right cameras)
-                # Each instance has its own TFLite interpreter and memory, allowing parallel processing
-                results = hands_processor.process(rgb_frame)
-                frame.flags.writeable = True
-
-                if results.multi_hand_landmarks:
-                    # Use first detected hand (no filtering)
-                    hand_landmarks = results.multi_hand_landmarks[0]
-
-                    # Landmark drawing removed - index finger circle drawn in update_display() instead
-                    # (21 landmarks + connections drawing removed for performance: ~5-8ms saved per camera)
-                    index_tip = hand_landmarks.landmark[8]
-                    if 0 <= index_tip.x <= 1 and 0 <= index_tip.y <= 1:
-                        h, w = frame.shape[:2]
-                        x = index_tip.x * w
-                        y = index_tip.y * h
-                        if 0 <= x <= w and 0 <= y <= h:
-                            raw_xy = [float(x), float(y)]
-
-            # 캐시 보정 적용
-            xy = self._cache_and_fill(camera_name, raw_xy)
-            return xy, display_frame
+            return [np.nan, np.nan], display_frame
 
         except Exception as e:
             self.logger.error(f"Hand detection error in {camera_name}: {e}")
-            xy = self._cache_and_fill(camera_name, [np.nan, np.nan])
-            return xy, frame.copy() if self.show_display else frame
-
-    # MARK: - Prediction
+            return [np.nan, np.nan], frame.copy()
 
     def predict_joint_positions(self, features):
         """Predict joint positions using loaded model"""
@@ -1237,8 +1056,6 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.error(f"Prediction error: {e}")
             return self.last_successful_positions.copy()
 
-    # MARK: - Display Update
-
     def update_display(self, frames, left_features, right_features):
         """Update camera display with concurrent mode indicators"""
         if not self.show_display:
@@ -1246,13 +1063,12 @@ class ConcurrentVoiceHardwareRunner:
 
         for camera_name, frame in frames.items():
             if frame is not None:
-                # Use the frame directly (already processed in extract_hand_features)
-                display_frame = frame
+                display_frame = frame.copy()
 
-                # Simplified status bar - only essential info
-                cv2.rectangle(display_frame, (10, 10), (200, 50), (0, 0, 0), -1)
+                # Add status indicators
+                cv2.rectangle(display_frame, (10, 10), (300, 110), (0, 0, 0), -1)
 
-                # Robot status (most important)
+                # Robot status
                 if self.robot_stopped:
                     robot_status = "STOPPED"
                     robot_color = (0, 165, 255)  # Orange
@@ -1262,22 +1078,32 @@ class ConcurrentVoiceHardwareRunner:
                 else:
                     robot_status = "HOME"
                     robot_color = (255, 255, 0)  # Cyan
-                cv2.putText(display_frame, robot_status,
-                           (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, robot_color, 2)
+                cv2.putText(display_frame, f"ROBOT: {robot_status}",
+                           (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, robot_color, 2)
 
-                # Emergency stop warning (only when active)
-                if self.emergency_stop:
-                    cv2.rectangle(display_frame, (5, 5), (635, 475), (0, 0, 255), 5)
-                    cv2.putText(display_frame, "EMERGENCY!",
-                               (200, 240), cv2.FONT_HERSHEY_BOLD, 1.5, (0, 0, 255), 4)
+                # Hand tracking status
+                tracking_color = (0, 255, 0) if self.hand_tracking_enabled else (0, 0, 255)
+                cv2.putText(display_frame, f"TRACKING: {'ON' if self.hand_tracking_enabled else 'OFF'}",
+                           (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, tracking_color, 2)
 
-                # Hand tracking - single circle only
+                # Voice status
+                voice_color = (0, 255, 0) if self.voice_active else (0, 0, 255)
+                cv2.putText(display_frame, f"VOICE: {'ACTIVE' if self.voice_active else 'INACTIVE'}",
+                           (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.4, voice_color, 2)
+
+                # Arduino status
+                arduino_color = (0, 255, 0) if self.arduino and self.arduino.is_open else (0, 0, 255)
+                cv2.putText(display_frame, f"ARDUINO: {'OK' if self.arduino and self.arduino.is_open else 'DISCONNECTED'}",
+                           (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, arduino_color, 2)
+
+                # Add hand tracking visualization if tracking is enabled
                 if self.hand_tracking_enabled:
                     features = left_features if camera_name == 'left' else right_features
                     x, y = features
                     if np.isfinite([x, y]).all():
                         color = (0, 255, 0) if camera_name == 'left' else (0, 255, 255)
-                        cv2.circle(display_frame, (int(x), int(y)), 10, color, -1)
+                        cv2.circle(display_frame, (int(x), int(y)), 12, color, -1)
+                        cv2.circle(display_frame, (int(x), int(y)), 15, (255, 255, 255), 2)
 
                 window_name = f"{camera_name.title()} Camera"
                 cv2.imshow(window_name, display_frame)
@@ -1287,88 +1113,24 @@ class ConcurrentVoiceHardwareRunner:
         if key == ord('q'):
             self.running = False
 
-    # MARK: - Voice Recognition
-
-    def _process_speech_stream(
-        self,
-        description: str,
-        timeout: float,
-        handler: Callable[[object], bool],
-        *,
-        for_command: bool = False,
-        timeout_message: Optional[str] = None,
-    ) -> str:
-        """Run a streaming recognition session and delegate responses to handler."""
-        stream_ctx = None
-        try:
-            stream_ctx, responses = start_stream(
-                self.mic_index, self.mic_hint, self.debug, for_command=for_command
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to start {description} stream: {e}")
-            return "start_error"
-
-        start_time = time.time()
-        try:
-            for response in responses:
-                if not self.running or not self.voice_active:
-                    return "stopped"
-
-                if timeout and time.time() - start_time > timeout:
-                    if timeout_message:
-                        print(timeout_message)
-                    return "timeout"
-
-                if response.results and handler(response):
-                    return "success"
-            return "no_match"
-        except Exception as e:
-            self.logger.error(f"{description.title()} recognition error: {e}")
-            return "error"
-        finally:
-            if stream_ctx:
-                try:
-                    stream_ctx.__exit__(None, None, None)
-                except Exception as close_err:
-                    self.logger.error(f"Error closing {description} stream: {close_err}")
-                    
     def voice_recognition_thread(self):
         """Background thread for continuous voice recognition"""
         print("🎤 Voice recognition thread started")
         consecutive_errors = 0
         max_consecutive_errors = 5
 
-        def wake_handler(response) -> bool:
-            for res in response.results:
-                if res.alternatives and not res.is_final:
-                    text = res.alternatives[0].transcript.strip()
-                    if text and detect_wake_interim(text):
-                        # Arduino에 무지개 효과 전송 (웨이크워드 시각적 확인)
-                        self.send_arduino_command("LED_EFFECT:3", quiet=True)
-                        return True
-            return False
-
-        def command_handler(response) -> bool:
-            for res in response.results:
-                if res.alternatives:
-                    text = res.alternatives[0].transcript.strip()
-                    if text:
-                        cmd = detect_cmd_interim(text)
-                        if cmd:
-                            self.handle_voice_command(cmd)
-                            return True
-            return False
-
         while self.running and self.voice_active:
-            try:
-                wake_status = self._process_speech_stream(
-                    "wake",
-                    10.0,
-                    wake_handler,
-                    for_command=False,
-                )
+            wake_stream = None
+            cmd_stream = None
 
-                if wake_status == "start_error":
+            try:
+                # Wake word detection
+                try:
+                    wake_stream, wake_responses = start_stream(
+                        self.mic_index, self.mic_hint, self.debug, for_command=False
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to start wake stream: {e}")
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         print("⚠️ Too many voice recognition errors, stopping voice thread")
@@ -1377,36 +1139,90 @@ class ConcurrentVoiceHardwareRunner:
                     time.sleep(2.0)
                     continue
 
-                if wake_status == "error":
+                wake_start = time.time()
+                got_wake = False
+
+                try:
+                    for response in wake_responses:
+                        if not self.running or not self.voice_active:
+                            break
+
+                        if time.time() - wake_start > 10.0:  # 10 second timeout
+                            break
+
+                        # Check for wake word
+                        if response.results:
+                            for res in response.results:
+                                if res.alternatives and not res.is_final:
+                                    text = res.alternatives[0].transcript.strip()
+                                    if text and detect_wake_interim(text):
+                                        if self.debug:
+                                            print(f"[WAKE] {text}")
+                                        got_wake = True
+                                        break
+                            if got_wake:
+                                break
+                except Exception as e:
+                    self.logger.error(f"Wake word detection error: {e}")
                     consecutive_errors += 1
-                    continue
+                finally:
+                    if wake_stream:
+                        try:
+                            wake_stream.__exit__(None, None, None)
+                        except Exception as e:
+                            self.logger.error(f"Error closing wake stream: {e}")
 
-                if wake_status == "stopped":
-                    break
-
-                if wake_status != "success":
+                if not got_wake or not self.running:
                     continue
 
                 print("✅ Wake word detected - Listening for command...")
 
-                cmd_status = self._process_speech_stream(
-                    "command",
-                    3.0,
-                    command_handler,
-                    for_command=False,
-                    timeout_message="⏰ Command timeout",
-                )
-
-                if cmd_status == "start_error":
+                # Command recognition
+                try:
+                    cmd_stream, cmd_responses = start_stream(
+                        self.mic_index, self.mic_hint, self.debug, for_command=False
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to start command stream: {e}")
                     consecutive_errors += 1
                     continue
 
-                if cmd_status == "stopped":
-                    break
+                cmd_start = time.time()
+                command_detected = False
+                try:
+                    for response in cmd_responses:
+                        if not self.running or not self.voice_active:
+                            break
 
-                if cmd_status == "error":
+                        if time.time() - cmd_start > 3.0:  # 3 second timeout
+                            print("⏰ Command timeout")
+                            break
+
+                        if response.results:
+                            for res in response.results:
+                                if res.alternatives:
+                                    text = res.alternatives[0].transcript.strip()
+                                    if text:
+                                        cmd = detect_cmd_interim(text)
+                                        if cmd:
+                                            if self.debug:
+                                                print(f"[CMD] {text} -> {cmd}")
+                                            self.handle_voice_command(cmd)
+                                            command_detected = True
+                                            break
+                            if command_detected:
+                                break
+                except Exception as e:
+                    self.logger.error(f"Command recognition error: {e}")
                     consecutive_errors += 1
+                finally:
+                    if cmd_stream:
+                        try:
+                            cmd_stream.__exit__(None, None, None)
+                        except Exception as e:
+                            self.logger.error(f"Error closing command stream: {e}")
 
+                # Reset error counter on successful cycle
                 consecutive_errors = 0
 
             except Exception as e:
@@ -1416,35 +1232,9 @@ class ConcurrentVoiceHardwareRunner:
                     print("⚠️ Too many voice recognition errors, stopping voice thread")
                     self.voice_active = False
                     break
-                time.sleep(2.0)
+                time.sleep(2.0)  # Longer pause on error
 
         print("🔇 Voice recognition thread stopped")
-
-    # MARK: - Arduino Reader Thread
-
-    def arduino_reader_thread_func(self):
-        """Background thread to continuously read Arduino serial data"""
-        print("📖 Arduino reader thread started")
-        while self.arduino_reader_active and self.running:
-            try:
-                with self._arduino_lock:
-                    if self.arduino and getattr(self.arduino, "is_open", False):
-                        # Read any available data to prevent buffer overflow
-                        if self.arduino.in_waiting > 0:
-                            try:
-                                line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
-                                if line and self.debug:
-                                    print(f"[Arduino] {line}")
-                            except Exception as e:
-                                if self.debug:
-                                    self.logger.error(f"Arduino read error: {e}")
-                time.sleep(0.01)  # Small delay to prevent CPU spinning
-            except Exception as e:
-                self.logger.error(f"Arduino reader thread error: {e}")
-                time.sleep(1.0)
-        print("📖 Arduino reader thread stopped")
-
-    # MARK: - Command Handling
 
     def handle_voice_command(self, command):
         """Handle recognized voice command"""
@@ -1454,73 +1244,35 @@ class ConcurrentVoiceHardwareRunner:
             print("🛑 Exit command received")
             self.running = False
 
-        # Emergency reset
-        elif command == "EMERGENCY_RESET":
-            print("🔄 EMERGENCY RESET - Recovering system...")
-            with self._robot_state_lock:
-                if self.emergency_stop:
-                    # Move to safe home position
-                    if not self.test_mode:
-                        safe_home = self.safe_holding_position
-                        # Temporarily allow movement by clearing emergency stop
-                        temp_emergency = self.emergency_stop
-                        self.emergency_stop = False
-                        success = self.move_to_position(safe_home)
-                        if success:
-                            self.consecutive_failures = 0
-                            self.robot_stopped = False
-                            self.hand_tracking_enabled = False
-                            print("✅ System RECOVERED - Emergency stop cleared, moved to HOME")
-                        else:
-                            self.emergency_stop = temp_emergency
-                            print("❌ Recovery FAILED - System still in emergency stop")
-                    else:
-                        self.emergency_stop = False
-                        self.consecutive_failures = 0
-                        print("✅ System RECOVERED (test mode)")
-                else:
-                    print("ℹ️ System is not in emergency stop")
-
         # Robot position control
         elif command == "STOP":
-            with self._robot_state_lock:
-                self.robot_stopped = True
-                self.hand_tracking_enabled = False
-            self.send_arduino_command("LED_EFFECT:11", quiet=True)  # 빨간색 깜빡임
+            self.robot_stopped = True
+            self.hand_tracking_enabled = False
             print("⏹️ Robot STOPPED at current position - Hand tracking disabled")
 
         elif command == "GO_HOME":
-            with self._robot_state_lock:
-                self.robot_stopped = False
-                self.hand_tracking_enabled = False
-                self.consecutive_failures = 0  # Reset communication failure counter
-            self.send_arduino_command("LED_EFFECT:10", quiet=True)  # 노란색 깜빡임
+            self.robot_stopped = False
+            self.hand_tracking_enabled = False
             print("🏠 Going HOME - Moving to safe position")
             # Move to safe home position immediately
             if not self.test_mode:
-                self.move_to_position(self.safe_holding_position)
+                clamped_positions = self.clamp_positions(self.safe_holding_position)
+                self.send_servo_commands(clamped_positions)
 
         # Hand tracking control
         elif command == "TRACKING_ON":
-            with self._robot_state_lock:
-                self.robot_stopped = False
-                self.hand_tracking_enabled = True
-            self.send_arduino_command("LED_EFFECT:9", quiet=True)  # 파란색 깜빡임
+            self.robot_stopped = False
+            self.hand_tracking_enabled = True
             print("📷 Hand tracking ENABLED - Robot will follow hand movements")
 
         # Arduino LED control
-        elif command in LED_COMMAND_MAP:
-            arduino_cmd = LED_COMMAND_MAP[command]
-            if self.ensure_arduino_connected(force=True):
-                success = self.send_arduino_command(arduino_cmd)
-                if not success:
-                    print(f"⚠️ Arduino 전송 실패 - 연결을 재시도합니다 ({arduino_cmd})")
-                    self._mark_arduino_disconnected()
+        elif command in ["LED_ON", "LED_OFF"]:
+            arduino_cmd = "ON" if command == "LED_ON" else "OFF"
+            if self.arduino:
+                send_arduino(self.arduino, arduino_cmd)
             else:
                 print(f"⚠️ Arduino not connected, cannot send {arduino_cmd}")
 
-
-    # MARK: - Main Loop
 
     def run_concurrent_loop(self):
         """Main control loop - camera + voice simultaneously"""
@@ -1531,12 +1283,6 @@ class ConcurrentVoiceHardwareRunner:
         # Start camera threads
         self.start_camera_threads()
 
-        # Start Arduino reader thread
-        if not self.test_mode:
-            self.arduino_reader_active = True
-            self.arduino_reader_thread = threading.Thread(target=self.arduino_reader_thread_func, daemon=True)
-            self.arduino_reader_thread.start()
-
         # Start voice recognition thread
         if self.voice_active:
             self.voice_thread = threading.Thread(target=self.voice_recognition_thread, daemon=True)
@@ -1546,62 +1292,39 @@ class ConcurrentVoiceHardwareRunner:
             while self.running:
                 loop_start = time.time()
 
-                self.ensure_arduino_connected()
-
-                arduino_ref = None
-                should_ping = False
-                if not self.test_mode:
-                    with self._arduino_lock:
-                        if self.arduino and getattr(self.arduino, "is_open", False):
-                            arduino_ref = self.arduino
-                            if time.time() - self._last_arduino_ping >= self._arduino_keepalive_interval:
-                                should_ping = True
-
-                if should_ping and arduino_ref:
-                    if self.send_arduino_command("STATUS", quiet=True):
-                        with self._arduino_lock:
-                            self._last_arduino_ping = time.time()
-                    else:
-                        self._mark_arduino_disconnected()
-
+                # Get camera frames
                 frames = self.get_latest_frames()
+                left_features, left_processed = self.extract_hand_features(frames.get('left'), 'left')
+                right_features, right_processed = self.extract_hand_features(frames.get('right'), 'right')
 
-                if self.hand_tracking_enabled or self.show_display:
-                    left_future = self.hand_tracking_executor.submit(
-                        self.extract_hand_features, frames.get('left'), 'left'
-                    )
-                    right_future = self.hand_tracking_executor.submit(
-                        self.extract_hand_features, frames.get('right'), 'right'
-                    )
-
-                    left_features, left_processed = left_future.result()
-                    right_features, right_processed = right_future.result()
-
-                    if left_processed is not None:
-                        frames['left'] = left_processed
-                    if right_processed is not None:
-                        frames['right'] = right_processed
-                else:
-                    left_features = [np.nan, np.nan]
-                    right_features = [np.nan, np.nan]
+                if left_processed is not None:
+                    frames['left'] = left_processed
+                if right_processed is not None:
+                    frames['right'] = right_processed
 
                 if self.show_display:
                     self.update_display(frames, left_features, right_features)
 
-                # Read robot state with lock to avoid race conditions
-                with self._robot_state_lock:
-                    robot_stopped = self.robot_stopped
-                    hand_tracking_enabled = self.hand_tracking_enabled
-
-                if robot_stopped:
+                # Robot arm control based on state
+                if self.robot_stopped:
+                    # Robot is stopped - maintain current position, don't send new commands
                     pass
-                elif hand_tracking_enabled and self.model is not None:
+                elif self.hand_tracking_enabled and self.model is not None:
+                    # Hand tracking is enabled - use camera prediction
                     combined_features = left_features + right_features
-                    final_positions = self.predict_joint_positions(combined_features)
+                    predicted_positions = self.predict_joint_positions(combined_features)
+                    final_positions = predicted_positions
+                    # Apply safety and send to servos
+                    if not self.test_mode:
+                        clamped_positions = self.clamp_positions(final_positions)
+                        self.send_servo_commands(clamped_positions)
                 else:
+                    # Hand tracking disabled - use safe holding position
                     final_positions = self.safe_holding_position
-
-                self.move_to_position(final_positions)
+                    # Apply safety and send to servos
+                    if not self.test_mode:
+                        clamped_positions = self.clamp_positions(final_positions)
+                        self.send_servo_commands(clamped_positions)
 
                 # Frame rate control
                 elapsed = time.time() - loop_start
@@ -1614,8 +1337,6 @@ class ConcurrentVoiceHardwareRunner:
         finally:
             self.cleanup()
 
-    # MARK: - Cleanup
-
     def cleanup(self):
         """Cleanup all resources"""
         self.logger.info("Cleaning up resources...")
@@ -1626,7 +1347,9 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.info("Moving servos to home position...")
             try:
                 # Move to safe home position
-                if self.move_to_position(DEFAULT_HOME_POSITION):
+                home_positions = [2048, 3328, 1140, 3072]  # Safe neutral position
+                clamped_positions = self.clamp_positions(home_positions)
+                if self.send_servo_commands(clamped_positions):
                     time.sleep(1.0)  # Allow time to reach position
                     self.logger.info("Servos moved to home position")
                 else:
@@ -1639,19 +1362,9 @@ class ConcurrentVoiceHardwareRunner:
             except Exception as e:
                 self.logger.error(f"Error during servo cleanup: {e}")
 
-        # Stop Arduino reader thread
-        if self.arduino_reader_thread and self.arduino_reader_thread.is_alive():
-            self.arduino_reader_active = False
-            self.arduino_reader_thread.join(timeout=2.0)
-
         # Stop voice thread
         if self.voice_thread and self.voice_thread.is_alive():
             self.voice_thread.join(timeout=2.0)
-
-        # Shutdown hand tracking executor
-        if hasattr(self, 'hand_tracking_executor'):
-            self.hand_tracking_executor.shutdown(wait=True, cancel_futures=True)
-            self.logger.info("Hand tracking executor shutdown")
 
         # Stop camera threads
         self.stop_camera_threads()
@@ -1669,19 +1382,16 @@ class ConcurrentVoiceHardwareRunner:
             cv2.destroyAllWindows()
 
         # Turn off Arduino LED and close connection
-        with self._arduino_lock:
-            arduino_ref = self.arduino if self.arduino and getattr(self.arduino, "is_open", False) else None
-
-        if arduino_ref:
+        if self.arduino and self.arduino.is_open:
             try:
                 self.logger.info("Turning off Arduino LED...")
-                if self.send_arduino_command("OFF"):
-                    time.sleep(0.5)  # Brief delay for command to process
-                    self.logger.info("Arduino LED turned off")
+                send_arduino(self.arduino, "OFF")
+                time.sleep(0.5)  # Brief delay for command to process
+                self.logger.info("Arduino LED turned off")
             except Exception as e:
                 self.logger.error(f"Failed to turn off Arduino LED: {e}")
 
-        self._mark_arduino_disconnected()
+            self.arduino.close()
 
         # Close servo port
         if not self.test_mode and DynamixelSDK_available and hasattr(self, 'port_handler'):
@@ -1693,7 +1403,9 @@ class ConcurrentVoiceHardwareRunner:
 
         self.logger.info("Cleanup completed")
 
-# MARK: - Entry Point
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Concurrent Voice + Hardware Runner")
@@ -1701,7 +1413,7 @@ def main():
     parser.add_argument("--config", default="hardware_config.json", help="Hardware configuration file")
     parser.add_argument("--arduino-port", default="/dev/arduino", help="Arduino port")
     parser.add_argument("--test", action='store_true', help="Run in test mode (no hardware control)")
-    parser.add_argument("--fps", type=float, default=30.0, help="Target FPS")
+    parser.add_argument("--fps", type=float, default=60.0, help="Target FPS")
     parser.add_argument("--display", action='store_true', help="Show camera windows")
     parser.add_argument("--no-camera", action='store_true', help="Disable camera control")
     parser.add_argument("--no-voice", action='store_true', help="Disable voice control")
@@ -1725,8 +1437,6 @@ def main():
     print("  Hand tracking: '추적 시작'")
     print("  Robot control: '정지' (stop at current position) / '홈' (go to home)")
     print("  Arduino LEDs: '켜' / '꺼'")
-    print("  Brightness: '밝게' / '어둡게'")
-    print("  Colors: '빨간불', '초록불', '파란불', '노란불', '하얀불', '무지개'")
     print("  System: '종료'")
     print()
     print("Default: Hand tracking DISABLED")

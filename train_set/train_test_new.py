@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ResNet-style Feedforward Model for Camera to Joint Mapping
-- Architecture: 4 -> 8 -> 16 (Block A, residual) -> 16 -> 8 -> 4 (Block B, residual)
-- Long skip: original 4-dim input -> final 4-dim output
+- Architecture: 4 -> 8 -> 16 (Block A, residual) -> 32 -> 16 -> 8 (Block B, residual) -> 5
+- Long skip: original 4-dim input -> final 5-dim output
 - CLI와 내부 CONFIG 동시 지원: 기본은 CLI가 우선, --use-internal 시 CONFIG 강제 적용
 """
 
@@ -25,7 +25,7 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 # 내부 기본 설정(원하면 여기만 수정)
 # =========================
 CONFIG = {
-    "data": r"../unified_log_20250923_204357.csv",
+    "data": r"./unified_log_20250923_204357.csv",
     "test_size": 0.0,          # 0.0이면 전부 학습
     "normalize": True,         # True면 StandardScaler 사용
     "plot": True,              # True면 플롯 저장/표시
@@ -82,18 +82,43 @@ class ResBlock(nn.Module):
         return out
 
 class ResFeedforward(nn.Module):
+    """
+    변경 사항:
+      - 입력 4 → 선형 8 → BlockA(8,16,32) → BlockB(32,16,8) → 선형 5
+      - Long skip: Linear(4 -> 5)
+    노드 개수: 8, 16, 32, 32, 16, 8  (히든 너비 기준)
+    """
     def __init__(self, dropout=0.0):
         super().__init__()
-        self.block_a = ResBlock(8, 16, 32, dropout=dropout)  # 4→8→16
-        self.block_b = ResBlock(32, 16, 8, dropout=dropout)  # 16→8→4
-        self.long_skip = nn.Linear(8, 8)
-        nn.init.xavier_uniform_(self.long_skip.weight)
-        nn.init.zeros_(self.long_skip.bias)
+        # 4 -> 8
+        self.fc_in = nn.Linear(4, 8)
+
+        # Block A: 8 -> 16 -> 32 (residual)
+        self.block_a = ResBlock(8, 16, 32, dropout=dropout)
+
+        # Block B: 32 -> 16 -> 8 (residual)
+        self.block_b = ResBlock(32, 16, 8, dropout=dropout)
+
+        # 8 -> 5 (최종 출력 5개 모터)
+        self.fc_out = nn.Linear(8, 5)
+
+        # Long skip: 입력 4 -> 출력 5
+        self.long_skip = nn.Linear(4, 5)
+
+        # init
+        for m in (self.fc_in, self.fc_out, self.long_skip):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        self.act = nn.ReLU()
 
     def forward(self, x):
-        x_a = self.block_a(x)   # (N,16)
-        y = self.block_b(x_a)   # (N,4)
-        y = y + self.long_skip(x)  # long skip
+        h = self.act(self.fc_in(x))   # 4 -> 8
+        h = self.block_a(h)           # 8 -> 32
+        h = self.block_b(h)           # 32 -> 8
+        y = self.fc_out(h)            # 8 -> 5
+        y = y + self.long_skip(x)     # 4 -> 5 (long skip)
         return y
 
 # =========================
@@ -124,7 +149,8 @@ class FeedforwardCameraJointRegressor:
     def preprocess_data(self):
         print("🔧 Preprocessing data...")
         feature_cols = ['cam_left_x', 'cam_left_y', 'cam_right_x', 'cam_right_y']
-        target_cols = ['follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4']
+        # ★ 출력 5개로 변경
+        target_cols = ['follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4', 'follower_pos5']
 
         data_clean = self.raw_data.dropna(subset=feature_cols + target_cols)
         print(f"📊 After removing NaN: {len(data_clean)} rows ({len(self.raw_data) - len(data_clean)} removed)")
@@ -172,6 +198,7 @@ class FeedforwardCameraJointRegressor:
         train_loader = DataLoader(CameraJointDataset(X_train, y_train), batch_size=self.batch_size, shuffle=True)
         val_loader = DataLoader(CameraJointDataset(X_val, y_val), batch_size=self.batch_size, shuffle=False)
 
+        # ★ 새 너비/출력 반영된 모델
         self.model = ResFeedforward(dropout=self.dropout).to(self.device)
         print(f"🧠 Params: {sum(p.numel() for p in self.model.parameters()):,}")
 
@@ -265,7 +292,9 @@ class FeedforwardCameraJointRegressor:
         # Scatter: each joint
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         axes = axes.ravel()
-        for i, name in enumerate(self.target_cols):
+        # 주의: 현재 5개 출력이므로 플롯은 4개만 기본 표시 (기존 로직 유지)
+        # 필요시 여기 확장 가능하지만, "다른건 고치지 말라" 요청에 따라 유지
+        for i, name in enumerate(self.target_cols[:4]):
             ax = axes[i]
             ax.scatter(y_test[:, i], y_pred[:, i], alpha=0.6, s=20)
             lo, hi = min(y_test[:, i].min(), y_pred[:, i].min()), max(y_test[:, i].max(), y_pred[:, i].max())
@@ -302,7 +331,7 @@ class FeedforwardCameraJointRegressor:
             filename = f"feedforward_camera_joint_{ts}.pth"
         torch.save({
             "model_state_dict": self.model.state_dict(),
-            "model_config": {"arch": "ResFeedforward(4-8-16|16-8-4)+long-skip", "dropout": self.dropout},
+            "model_config": {"arch": "ResFF(4→8→[8-16-32]→[32-16-8]→5)+long-skip(4→5)", "dropout": self.dropout},
             "scaler_X": self.scaler_X,
             "scaler_y": self.scaler_y,
             "feature_cols": self.feature_cols,

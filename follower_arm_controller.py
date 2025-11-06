@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unified Follower Arm Controller
-Handles mixed motor types: XL430-W250-T (3 motors) + XL330-M288-T (1 motor)
+Handles mixed motor types: XL430-W250-T (3 motors) + XL330-M288-T (2 motors)
 Complete terminal interface for position reading, torque control, and real-time monitoring
 """
 
@@ -80,6 +80,15 @@ MOTOR_CONFIGS = {
         'position_min': 0,
         'position_max': 4095,
         'angle_resolution': 0.088
+    },
+    # XL330-M288-T motor (ID 5)
+    5: {
+        'model': 'XL330-M288-T',
+        'model_number': 1200,
+        'position_center': 2048,
+        'position_min': 0,
+        'position_max': 4095,
+        'angle_resolution': 0.088
     }
 }
 
@@ -93,7 +102,7 @@ ADDR_PRESENT_CURRENT = 126
 ADDR_PRESENT_TEMPERATURE = 146
 
 # Motor IDs
-MOTOR_IDS = [1, 2, 3, 4]
+MOTOR_IDS = [1, 2, 3, 4, 5]
 
 # Global variables
 port_handler = None
@@ -500,8 +509,8 @@ def show_help():
     print_colored("\n⚡ Torque Control:", Colors.CYAN)
     print("  'e' or 'enable'     - Enable torque for all motors")
     print("  'd' or 'disable'    - Disable torque for all motors")
-    print("  'e1', 'e2', etc     - Enable torque for specific motor")
-    print("  'd1', 'd2', etc     - Disable torque for specific motor")
+    print("  'e1'-'e5'           - Enable torque for specific motor (e.g., e1, e5)")
+    print("  'd1'-'d5'           - Disable torque for specific motor (e.g., d1, d5)")
     
     print_colored("\n🎯 Position Control:", Colors.CYAN)
     print("  'center'             - Move all motors to center position (0°)")
@@ -518,7 +527,7 @@ def show_help():
     print_colored("=" * 80, Colors.HEADER)
     print_colored("💡 Motor Types:", Colors.WARNING)
     print("  - Motors 1-3: XL430-W250-T")
-    print("  - Motor 4:    XL330-M288-T")
+    print("  - Motors 4-5: XL330-M288-T")
     print("  - All motors: Center=2048 (0°), Range=0-4095 (≈±180°)")
     print("  - Motors must have torque enabled to move")
 
@@ -546,7 +555,7 @@ def main():
     print(f"Device: {DEVICE_NAME}")
     print(f"Baudrate: {BAUDRATE}")
     print(f"Expected Motors: {MOTOR_IDS}")
-    print(f"Motor Types: XL430-W250-T (1,2,3) + XL330-M288-T (4)")
+    print(f"Motor Types: XL430-W250-T (1,2,3) + XL330-M288-T (4,5)")
     print_colored("=" * 70, Colors.HEADER)
     
     # Initialize

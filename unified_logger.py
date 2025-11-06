@@ -59,7 +59,8 @@ class UnifiedLogger:
         # Last known robot positions
         self.last_robot_positions = {
             'follower_pos1': None, 'follower_pos2': None,
-            'follower_pos3': None, 'follower_pos4': None
+            'follower_pos3': None, 'follower_pos4': None,
+            'follower_pos5': None
         }
 
         # Sync control
@@ -67,9 +68,9 @@ class UnifiedLogger:
         self.sync_thread = None
 
         # Calibration data
-        self.position_offsets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-        self.direction_multipliers = {1: 1, 2: 1, 3: 1, 4: 1}
-        self.id_map = {1: 1, 2: 2, 3: 3, 4: 4}
+        self.position_offsets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
+        self.direction_multipliers = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1}
+        self.id_map = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
 
     def load_hardware_config(self):
         """Load hardware configuration from hardware_config.json"""
@@ -80,33 +81,36 @@ class UnifiedLogger:
                 'addr_present_position': 132,
                 'addr_goal_position': 116,
                 'addr_torque_enable': 64,
-                'motor_ids': [1, 2, 3, 4],
+                'motor_ids': [1, 2, 3, 4, 5],
                 'leader': {
                     'port': '/dev/leader_arm',
                     'baudrate': 1000000,
                     'enabled': True,
                     'motors': {
                         '1': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-                        '2': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+                        '2': {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088},
                         '3': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-                        '4': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
+                        '4': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+                        '5': {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
                     }
                 },
                 'follower': {
                     'port': '/dev/follower_arm',
                     'baudrate': 1000000,
                     'enabled': True,
+                    'position_p_gains': [640, 640, 640, 100, 100],
                     'motors': {
                         '1': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
                         '2': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
                         '3': {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
-                        '4': {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
+                        '4': {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088},
+                        '5': {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
                     }
                 }
             },
             'cameras': {
-                'cam_left': {'id': 0, 'enabled': True},
-                'cam_right': {'id': 2, 'enabled': True}
+                'cam_left': {'id': '/dev/cam_left', 'enabled': True},
+                'cam_right': {'id': '/dev/cam_right', 'enabled': True}
             }
         }
 
@@ -133,6 +137,7 @@ class UnifiedLogger:
                             'port': robot_arms_config.get('follower', {}).get('port', default_config['robot_arms']['follower']['port']),
                             'baudrate': robot_arms_config.get('follower', {}).get('baudrate', default_config['robot_arms']['follower']['baudrate']),
                             'enabled': robot_arms_config.get('follower', {}).get('enabled', default_config['robot_arms']['follower']['enabled']),
+                            'position_p_gains': robot_arms_config.get('follower', {}).get('position_p_gains', default_config['robot_arms']['follower']['position_p_gains']),
                             'motors': robot_arms_config.get('follower', {}).get('motors', default_config['robot_arms']['follower']['motors'])
                         }
                     }
@@ -165,6 +170,7 @@ class UnifiedLogger:
         self.ADDR_PRESENT_POSITION = self.robot_arms_config['addr_present_position']
         self.ADDR_GOAL_POSITION = self.robot_arms_config['addr_goal_position']
         self.ADDR_TORQUE_ENABLE = self.robot_arms_config['addr_torque_enable']
+        self.ADDR_POSITION_P_GAIN = 84  # Position P Gain address for Protocol 2.0
         self.MOTOR_IDS = self.robot_arms_config['motor_ids']
 
         # Convert string motor IDs to integers for motors config
@@ -187,6 +193,7 @@ class UnifiedLogger:
             'port': self.robot_arms_config['follower']['port'],
             'baudrate': self.robot_arms_config['follower']['baudrate'],
             'enabled': self.robot_arms_config['follower']['enabled'],
+            'position_p_gains': self.robot_arms_config['follower']['position_p_gains'],
             'motors': follower_motors
         }
 
@@ -253,12 +260,8 @@ class UnifiedLogger:
 
     def open_camera(self, device_id):
         """Open camera with optimized settings"""
-        if isinstance(device_id, str) and device_id.startswith('/dev/'):
-            try:
-                device_id = int(device_id.split('video')[1])
-            except:
-                device_id = 0
-
+        # Support both device paths (/dev/cam_left) and integer indices (0, 2)
+        # OpenCV's VideoCapture accepts both string paths and integer indices
         cap = cv2.VideoCapture(device_id, cv2.CAP_V4L2)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -279,9 +282,9 @@ class UnifiedLogger:
             with open(filename, 'r') as f:
                 calibration_data = json.load(f)
 
-            self.position_offsets = calibration_data.get('position_offsets', {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-            self.direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1})
-            self.id_map = calibration_data.get('id_map', {1: 1, 2: 2, 3: 3, 4: 4})
+            self.position_offsets = calibration_data.get('position_offsets', {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0})
+            self.direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+            self.id_map = calibration_data.get('id_map', {1: 1, 2: 2, 3: 3, 4: 4, 5: 5})
 
             # Convert string keys to int if needed
             if isinstance(list(self.position_offsets.keys())[0], str):
@@ -373,6 +376,21 @@ class UnifiedLogger:
                 print(f"  ❌ Motor {motor_id}: Failed ({e})")
 
         print(f"✓ Follower motors: {self.connected_follower_motors}")
+
+        # Apply P gain values to connected follower motors
+        if self.connected_follower_motors and 'position_p_gains' in self.FOLLOWER_CONFIG:
+            print("⚙️  Setting Position P Gains for follower motors...")
+            p_gains = self.FOLLOWER_CONFIG['position_p_gains']
+
+            for i, motor_id in enumerate(self.MOTOR_IDS):
+                if motor_id in self.connected_follower_motors and i < len(p_gains):
+                    p_gain_value = p_gains[i]
+                    if self.set_motor_p_gain(self.follower_port_handler, self.follower_packet_handler,
+                                            motor_id, p_gain_value):
+                        print(f"  ✓ Motor {motor_id}: P Gain set to {p_gain_value}")
+                    else:
+                        print(f"  ⚠️  Motor {motor_id}: Failed to set P Gain to {p_gain_value}")
+
         return len(self.connected_follower_motors) > 0
 
     def get_hand_coordinates_with_frames(self, draw_landmarks=False):
@@ -442,10 +460,11 @@ class UnifiedLogger:
         """Get current positions from follower robot arm"""
         positions = {
             'follower_pos1': None, 'follower_pos2': None,
-            'follower_pos3': None, 'follower_pos4': None
+            'follower_pos3': None, 'follower_pos4': None,
+            'follower_pos5': None
         }
 
-        for i, motor_id in enumerate([1, 2, 3, 4], 1):
+        for i, motor_id in enumerate([1, 2, 3, 4, 5], 1):
             if motor_id in self.connected_follower_motors:
                 try:
                     position, comm_result, error = self.follower_packet_handler.read4ByteTxRx(
@@ -489,6 +508,13 @@ class UnifiedLogger:
         """Set torque state for a specific motor"""
         comm_result, error = packet_handler.write1ByteTxRx(
             port_handler, motor_id, self.ADDR_TORQUE_ENABLE, 1 if enable else 0)
+
+        return comm_result == COMM_SUCCESS and error == 0
+
+    def set_motor_p_gain(self, port_handler, packet_handler, motor_id, p_gain_value):
+        """Set Position P Gain for a specific motor"""
+        comm_result, error = packet_handler.write2ByteTxRx(
+            port_handler, motor_id, self.ADDR_POSITION_P_GAIN, int(p_gain_value))
 
         return comm_result == COMM_SUCCESS and error == 0
 
@@ -628,7 +654,7 @@ class UnifiedLogger:
         # Write header
         header = [
             'timestamp', 'cam_left_x', 'cam_left_y', 'cam_right_x', 'cam_right_y',
-            'follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4'
+            'follower_pos1', 'follower_pos2', 'follower_pos3', 'follower_pos4', 'follower_pos5'
         ]
         self.csv_writer.writerow(header)
         self.output_file.flush()
@@ -663,7 +689,8 @@ class UnifiedLogger:
                 data_point['cam_left_x'], data_point['cam_left_y'],
                 data_point['cam_right_x'], data_point['cam_right_y'],
                 data_point['follower_pos1'], data_point['follower_pos2'],
-                data_point['follower_pos3'], data_point['follower_pos4']
+                data_point['follower_pos3'], data_point['follower_pos4'],
+                data_point['follower_pos5']
             ]
             self.csv_writer.writerow(row)
             self.output_file.flush()
@@ -709,14 +736,14 @@ class UnifiedLogger:
                 # Update terminal display every 10 samples
                 if count % 10 == 0:
                     hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
-                    robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
+                    robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,6)) else "❌"
                     sync_status = "🔄" if self.sync_active else "⏸️"
 
                     print(f"\r📊 [{count:4d}] {hand_status} {robot_status} {sync_status} | "
                           f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
                           f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                           f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
-                          f"{data_point['follower_pos3']},{data_point['follower_pos4']}]", end="", flush=True)
+                          f"{data_point['follower_pos3']},{data_point['follower_pos4']},{data_point['follower_pos5']}]", end="", flush=True)
 
                 # Check for ESC key to stop (optional)
                 if cv2.waitKey(1) & 0xFF == 27:
@@ -769,14 +796,14 @@ class UnifiedLogger:
 
                 # Show current status in terminal
                 hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
-                robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
+                robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,6)) else "❌"
                 sync_status = "🔄" if self.sync_active else "⏸️"
 
                 print(f"\r{hand_status} {robot_status} {sync_status} | "
                       f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
                       f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                       f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
-                      f"{data_point['follower_pos3']},{data_point['follower_pos4']}] "
+                      f"{data_point['follower_pos3']},{data_point['follower_pos4']},{data_point['follower_pos5']}] "
                       f"| Snapshots: {snapshot_count}", end="", flush=True)
 
                 # Check for key press
@@ -942,14 +969,14 @@ def main():
 
                     # Terminal display
                     hand_status = "👋" if (data_point['cam_left_x'] or data_point['cam_right_x']) else "🚫"
-                    robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,5)) else "❌"
+                    robot_status = "🤖" if any(data_point[f'follower_pos{i}'] for i in range(1,6)) else "❌"
                     sync_status = "🔄" if logger.sync_active else "⏸️"
 
                     print(f"\r{hand_status} {robot_status} {sync_status} | "
                           f"CL:({data_point['cam_left_x']},{data_point['cam_left_y']}) "
                           f"CR:({data_point['cam_right_x']},{data_point['cam_right_y']}) "
                           f"R:[{data_point['follower_pos1']},{data_point['follower_pos2']},"
-                          f"{data_point['follower_pos3']},{data_point['follower_pos4']}]", end="", flush=True)
+                          f"{data_point['follower_pos3']},{data_point['follower_pos4']},{data_point['follower_pos5']}]", end="", flush=True)
 
                     # Check for ESC key
                     if cv2.waitKey(1) & 0xFF == 27:
@@ -965,7 +992,7 @@ def main():
             logger.init_output_file(args.output)
 
             print("✅ All systems initialized successfully")
-            print(f"📊 Data format: timestamp, cam_left_x, cam_left_y, cam_right_x, cam_right_y, follower_pos1-4")
+            print(f"📊 Data format: timestamp, cam_left_x, cam_left_y, cam_right_x, cam_right_y, follower_pos1-5")
             if args.sync:
                 print("🔄 Leader-follower synchronization will be active during recording")
             print("=" * 60)

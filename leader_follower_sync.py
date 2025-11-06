@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Leader-Follower Arm Synchronization Controller
-Real-time synchronization between leader arm (XL330-M077-T x4) and follower arm (XL430-W250-T x3 + XL330-M288-T x1)
+Real-time synchronization between leader arm (XL330-M077-T x4 + XL330-M288-T x1) and follower arm (XL430-W250-T x3 + XL330-M288-T x2)
 """
 
 import os
@@ -56,21 +56,22 @@ ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_CURRENT = 126
 
 # Motor Configuration
-MOTOR_IDS = [1, 2, 3, 4]
+MOTOR_IDS = [1, 2, 3, 4, 5]
 
-# Leader Arm Configuration (XL330-M077-T x4)
+# Leader Arm Configuration (XL330-M077-T x4 + XL330-M288-T x1)
 LEADER_CONFIG = {
     'port': hw_config['leader']['port'],
     'baudrate': hw_config['leader']['baudrate'],
     'motors': {
         1: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-        2: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+        2: {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088},
         3: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
-        4: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
+        4: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088},
+        5: {'model': 'XL330-M077-T', 'center': 2048, 'resolution': 0.088}
     }
 }
 
-# Follower Arm Configuration (XL430-W250-T x3 + XL330-M288-T x1)
+# Follower Arm Configuration (XL430-W250-T x3 + XL330-M288-T x2)
 FOLLOWER_CONFIG = {
     'port': hw_config['follower']['port'],
     'baudrate': hw_config['follower']['baudrate'],
@@ -78,7 +79,8 @@ FOLLOWER_CONFIG = {
         1: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
         2: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
         3: {'model': 'XL430-W250-T', 'center': 2048, 'resolution': 0.088},
-        4: {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
+        4: {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088},
+        5: {'model': 'XL330-M288-T', 'center': 2048, 'resolution': 0.088}
     }
 }
 
@@ -93,11 +95,11 @@ sync_active = False
 sync_thread = None
 
 # Position offset for calibration (angle differences between leader and follower)
-position_offsets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}  # degrees
+position_offsets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}  # degrees
 # Per-motor rotation direction mapping: +1 (same) or -1 (inverted)
-direction_multipliers = {1: 1, 2: 1, 3: 1, 4: 1}
+direction_multipliers = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1}
 # Leader→Follower motor ID map (default identity)
-id_map = {1: 1, 2: 2, 3: 3, 4: 4}
+id_map = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -519,9 +521,9 @@ def load_calibration(filename="calibration.json"):
         with open(filename, 'r') as f:
             calibration_data = json.load(f)
         
-        position_offsets = calibration_data.get('position_offsets', {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-        direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1)
-        id_map = calibration_data.get('id_map', {1: 1, 2: 2, 3: 3, 4: 4})
+        position_offsets = calibration_data.get('position_offsets', {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0})
+        direction_multipliers = calibration_data.get('direction_multipliers', {1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+        id_map = calibration_data.get('id_map', {1: 1, 2: 2, 3: 3, 4: 4, 5: 5})
         
         # Convert string keys to int if needed
         if isinstance(list(position_offsets.keys())[0], str):
@@ -593,7 +595,7 @@ def show_help():
     print("  'cal load'           - Load calibration (offsets + direction) from file")
     print("                        Tip: set direction via zero_calibration_helper.py → 'dir' commands")
     print("  'map L F'            - Map leader motor L to follower motor F (e.g., 'map 2 3')")
-    print("  'map reset'          - Reset mapping to identity (1→1, 2→2, 3→3, 4→4)")
+    print("  'map reset'          - Reset mapping to identity (1→1, 2→2, 3→3, 4→4, 5→5)")
     
     print_colored("\n🔧 System:", Colors.CYAN)
     print("  'h' or 'help'       - Show this help")
@@ -730,9 +732,9 @@ def main():
                             id_map[l] = f
                             print_colored(f"✓ Set mapping L{l} → F{f}", Colors.GREEN)
                         else:
-                            print_colored("❌ Usage: map <leader_id 1-4> <follower_id 1-4>", Colors.FAIL)
+                            print_colored("❌ Usage: map <leader_id 1-5> <follower_id 1-5>", Colors.FAIL)
                     except ValueError:
-                        print_colored("❌ Usage: map <leader_id 1-4> <follower_id 1-4>", Colors.FAIL)
+                        print_colored("❌ Usage: map <leader_id 1-5> <follower_id 1-5>", Colors.FAIL)
                 else:
                     print_colored("❌ Invalid 'map' usage", Colors.FAIL)
                     

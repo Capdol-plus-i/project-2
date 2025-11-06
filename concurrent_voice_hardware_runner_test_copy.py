@@ -4,9 +4,9 @@
 Concurrent Voice + Hardware Runner
 - Camera: MediaPipe hand tracking → MLP → robot arm control (continuous)
 - Voice: speech recognition → Arduino LED control (background)
-- Reaction-time measurement (background thread):
-    main loop: just push (t_capture, servo_id, timeout...) to queue
-    worker   : poll Dynamixel present vel/pos → put result back
+- Reaction-time measurement:
+    start = camera capture timestamp of the frame where a hand is ACTUALLY detected
+    end   = the moment the robot arm ACTUALLY STARTS MOVING (via Present Vel/Pos polling)
 """
 
 import torch
@@ -106,8 +106,8 @@ LED_COMMAND_MAP = {
     "LED_YELLOW": "YELLOW", "LED_WHITE": "WHITE", "LED_RAINBOW": "RAINBOW",
 }
 
-# 5축으로 통일
-DEFAULT_HOME_POSITION = [2048, 3328, 1140, 3072, 2048]
+# NOTE: 길이 불일치 시 런타임에 자동 보정하므로 기본값은 4개로 둔다.
+DEFAULT_HOME_POSITION = [2048, 3328, 1140, 3072]
 
 # =============================================================================
 # MODELS
@@ -121,7 +121,7 @@ class BaseModel(nn.Module):
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
 class SimpleTransformer(BaseModel):
-    def __init__(self, input_dim=4, output_dim=5, d_model=8, nhead=1,
+    def __init__(self, input_dim=4, output_dim=4, d_model=8, nhead=1,
                  num_layers=1, dim_feedforward=12, dropout=0.0):
         super().__init__()
         self.network = nn.Sequential(
@@ -133,7 +133,7 @@ class SimpleTransformer(BaseModel):
     def forward(self, x): return self.network(x)
 
 class ConfigurableFeedforward(BaseModel):
-    def __init__(self, input_dim=4, output_dim=5, hidden_sizes: Sequence[int]|None=None, dropout: float=0.0):
+    def __init__(self, input_dim=4, output_dim=4, hidden_sizes: Sequence[int]|None=None, dropout: float=0.0):
         super().__init__()
         hidden_tuple = tuple(hidden_sizes) if hidden_sizes is not None else ()
         if not hidden_tuple: raise ValueError("hidden_sizes must contain at least one layer")
@@ -148,6 +148,7 @@ class ConfigurableFeedforward(BaseModel):
         self._init_weights()
     def forward(self, x): return self.network(x)
 
+# ===== 학습 스크립트 구조와 동일한 ResNet-스타일 MLP =====
 class ResidualBlock(BaseModel):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.0):
         super().__init__()
@@ -156,24 +157,42 @@ class ResidualBlock(BaseModel):
         self.act = nn.ReLU()
         self.proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
         self.norm = nn.LayerNorm(output_dim)
-        self.drop = nn.Dropout(dropout)
+        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self._init_weights()
     def forward(self, x):
         r = self.proj(x)
         o = self.act(self.fc1(x))
         o = self.drop(self.fc2(o))
-        o = self.norm(o + r)
+        o = self.act(self.norm(o + r))
         return o
 
 class ResFeedforward(BaseModel):
+    """
+    학습 모델과 동일:
+      fc_in:      4 → 8
+      Block A:    8 → 16 → 32 (residual)
+      Block B:    32 → 16 → 8 (residual)
+      fc_out:     8 → output_dim
+      long_skip:  4 → output_dim
+    """
     def __init__(self, input_dim=4, output_dim=5, dropout=0.0):
         super().__init__()
-        self.block_a = ResidualBlock(input_dim, 8, 16, dropout)
-        self.block_b = ResidualBlock(16, 8, output_dim, dropout)
+        self.fc_in = nn.Linear(input_dim, 8)
+        self.block_a = ResidualBlock(8, 16, 32, dropout)
+        self.block_b = ResidualBlock(32, 16, 8, dropout)
+        self.fc_out = nn.Linear(8, output_dim)
         self.long_skip = nn.Linear(input_dim, output_dim)
-        self._init_weights()
+        self.act = nn.ReLU()
+        # init
+        for m in (self.fc_in, self.fc_out, self.long_skip):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None: nn.init.zeros_(m.bias)
     def forward(self, x):
-        return self.block_b(self.block_a(x)) + self.long_skip(x)
+        h = self.act(self.fc_in(x))
+        h = self.block_a(h)
+        h = self.block_b(h)
+        y = self.fc_out(h)
+        return y + self.long_skip(x)
 
 # =============================================================================
 # VOICE UTILS
@@ -422,6 +441,7 @@ class ConcurrentVoiceHardwareRunner:
         self.model = None; self.model_type = None
         self.scaler_X = None; self.scaler_y = None
         self.normalize = False
+        self.output_dim = 4  # will be overwritten if ckpt says 5
         if model_path: self.load_model()
 
         # Hardware config
@@ -446,19 +466,21 @@ class ConcurrentVoiceHardwareRunner:
         # Safety / smoothing
         self.consecutive_failures = 0
         self.max_consecutive_failures = 10
-        self.last_successful_positions = DEFAULT_HOME_POSITION.copy()
+        self.last_successful_positions = self._aligned_home_positions()
         self.position_smoothing_alpha = 0.3
-        self.last_positions = DEFAULT_HOME_POSITION.copy()
+        self.last_positions = self._aligned_home_positions()
         self.emergency_stop = False
-        # 5축으로 맞춰줌
-        self.safe_zone_min = [1280, 1920, 1120, 1664, 2048]
-        self.safe_zone_max = [2944, 3456, 3200, 3136, 4096]
-        self.safe_holding_position = DEFAULT_HOME_POSITION.copy()
+
+        # 안전 구간 (길이 자동 정합)
+        self.safe_zone_min = self._align_len(self.config.get('safe_zone_min', [1280,1920,1120,1664]),
+                                             len(self.servo_ids), fill_val=1280)
+        self.safe_zone_max = self._align_len(self.config.get('safe_zone_max', [2944,3456,3200,3136]),
+                                             len(self.servo_ids), fill_val=3072)
+        self.safe_holding_position = self._aligned_home_positions()
         self.last_sent_positions = None
 
         # Hand coordinate cache (per camera) with TTL
-        # (반응성 위해 0.1로 줄임)
-        self.cache_ttl = 0.1
+        self.cache_ttl = 0.5
         self.coord_cache = {'left': {'xy':[np.nan,np.nan],'t':0.0},
                             'right':{'xy':[np.nan,np.nan],'t':0.0}}
 
@@ -468,7 +490,7 @@ class ConcurrentVoiceHardwareRunner:
         # Arduino init
         self.ensure_arduino_connected(force=True)
 
-        # Reaction time stats (이제는 비블로킹)
+        # Reaction time stats
         self.measure_reaction_time = True
         self.rt_every_n = 20
         self._rt_counter = 0
@@ -476,18 +498,29 @@ class ConcurrentVoiceHardwareRunner:
         self._rt_min_ms = float('inf')
         self._rt_max_ms = 0.0
 
-        # 측정 파라미터
-        self.motion_onset_timeout_ms = 80.0
-        self.motion_pos_delta_thresh = 2
-        self.motion_check_servo_idx = 0
+        # Measurement tuning
+        self.motion_onset_timeout_ms = 80.0     # how long to wait for motion start after sending
+        self.motion_pos_delta_thresh = 2        # ticks to declare "started moving"
+        self.motion_check_servo_idx = 0         # check this index in self.servo_ids
 
-        # RT 백그라운드 워커용 큐/스레드
-        # (queue.Queue는 쓰레드 세이프)
-        self.rt_tasks: queue.Queue = queue.Queue(maxsize=100)
-        self.rt_results: queue.Queue = queue.Queue(maxsize=200)
-        self.rt_worker_running = True
-        self.rt_worker_thread = threading.Thread(target=self._rt_worker, daemon=True)
-        self.rt_worker_thread.start()
+    # ----- helpers for length alignment -----
+    def _align_len(self, arr: List[int], n: int, fill_val: int) -> List[int]:
+        arr = list(arr or [])
+        if len(arr) == n: return arr
+        if len(arr) > n: return arr[:n]
+        return arr + [fill_val] * (n - len(arr))
+
+    def _aligned_home_positions(self) -> List[int]:
+        # 기본 홈값을 서보 개수에 맞춰 보정
+        if hasattr(self, 'servo_ids'):
+            n = len(self.servo_ids)
+        else:
+            n = 4
+        base = list(DEFAULT_HOME_POSITION)
+        if len(base) >= n: return base[:n]
+        # 부족하면 중간값(안전 범위 중앙)으로 채움
+        fill = 2048
+        return base + [fill] * (n - len(base))
 
     # ===== Arduino helpers =====
     def ensure_arduino_connected(self, force: bool = False) -> bool:
@@ -562,6 +595,7 @@ class ConcurrentVoiceHardwareRunner:
     def load_model(self):
         self.model_type = None; self.normalize = False
         self.scaler_X = None; self.scaler_y = None
+        self.output_dim = 4
         if self.model_path.lower().endswith(".joblib"):
             self.logger.info(f"Loading XGBoost model from {self.model_path}")
             self.model = joblib.load(self.model_path); self.model_type = "xgb"
@@ -570,46 +604,41 @@ class ConcurrentVoiceHardwareRunner:
             ckpt = torch.load(self.model_path, map_location=self.device, weights_only=False)
             config = ckpt.get('model_config', {}) or {}
             state_dict = ckpt['model_state_dict']
-            arch = config.get('arch')
-            if arch is None:
-                if 'hidden_sizes' in config: arch = 'feedforward'
-                elif 'resfeedforward' in config.get('model_name', '').lower(): arch = 'resfeedforward'
-                else: arch = 'transformer'
-            al = arch.lower()
-            if 'feedforward' in al and 'res' not in al:
+            # 출력 차원은 우선 target_cols 길이로, 없으면 fc_out.weight로 추정
+            target_cols = ckpt.get('target_cols', None)
+            if isinstance(target_cols, (list, tuple)) and len(target_cols) >= 1:
+                self.output_dim = int(len(target_cols))
+            else:
+                # state_dict에서 fc_out.weight shape[0]으로 추정
+                for k, v in state_dict.items():
+                    if k.endswith("fc_out.weight") and hasattr(v, "shape"):
+                        self.output_dim = int(v.shape[0]); break
+
+            arch = (config.get('arch') or '').lower()
+            if 'resff' in arch or 'resfeedforward' in arch or 'res' in arch:
+                self.model = ResFeedforward(4, self.output_dim, config.get('dropout', 0.0)).to(self.device)
+                self.logger.info(f"Created ResFeedforward model (output_dim={self.output_dim})")
+            elif 'feedforward' in arch and 'res' not in arch:
                 hidden_sizes = config.get('hidden_sizes')
-                has_ln = any('.1.' in k for k in state_dict.keys())
-                if not hidden_sizes and not has_ln:
-                    self.model = SimpleTransformer(
-                        input_dim=4, output_dim=5,
-                        d_model=config.get('d_model', config.get('dim_feedforward', 12)),
-                        nhead=config.get('nhead', 1), num_layers=1,
-                        dim_feedforward=config.get('dim_feedforward', 12), dropout=0.0
-                    ).to(self.device)
-                    self.logger.info("Detected legacy feedforward; using SimpleTransformer layout")
+                if hidden_sizes:
+                    hidden_sizes = tuple(int(x) for x in hidden_sizes)
                 else:
-                    if not hidden_sizes:
-                        n = max(int(config.get('num_layers', 1)), 1)
-                        d = int(config.get('dim_feedforward', 12))
-                        hidden_sizes = tuple(d for _ in range(n))
-                    else:
-                        hidden_sizes = tuple(int(x) for x in hidden_sizes)
-                    self.model = ConfigurableFeedforward(4, 5, hidden_sizes, float(config.get('dropout', 0.0))).to(self.device)
-                    self.logger.info(f"Created ConfigurableFeedforward with hidden_sizes={hidden_sizes}")
-            elif 'res' in al:
-                self.model = ResFeedforward(4, 5, config.get('dropout', 0.0)).to(self.device)
-                self.logger.info(f"Created ResFeedforward model: {arch}")
+                    hidden_sizes = (12,)
+                self.model = ConfigurableFeedforward(4, self.output_dim, hidden_sizes, float(config.get('dropout', 0.0))).to(self.device)
+                self.logger.info(f"Created ConfigurableFeedforward with hidden_sizes={hidden_sizes}")
             else:
                 self.model = SimpleTransformer(
-                    4, 5, config.get('d_model', 8), config.get('nhead', 1),
+                    4, self.output_dim,
+                    config.get('d_model', 8), config.get('nhead', 1),
                     config.get('num_layers', 1), config.get('dim_feedforward', 12), 0.0
                 ).to(self.device)
                 self.logger.info("Created SimpleTransformer model")
+
             self.model.load_state_dict(state_dict); self.model.eval()
             self.scaler_X = ckpt.get('scaler_X', None); self.scaler_y = ckpt.get('scaler_y', None)
-            self.normalize = ckpt.get('normalize', False)
+            self.normalize = bool(ckpt.get('normalize', False))
             self.model_type = "torch"
-            self.logger.info(f"PyTorch model loaded from {self.model_path}")
+            self.logger.info(f"PyTorch model loaded from {self.model_path} (normalize={self.normalize}, out_dim={self.output_dim})")
         except Exception as e:
             self.logger.error(f"Failed to load model: {e}"); raise
 
@@ -620,22 +649,22 @@ class ConcurrentVoiceHardwareRunner:
         except FileNotFoundError:
             self.logger.warning(f"Hardware config not found: {config_path}, using defaults")
             self.config = {
-                "servos": {"port":"/dev/ttyUSB0","baudrate":1000000,"ids":[1,2,3,4,5],
-                           "min_positions":[1280,1920,1120,1664,2048], "max_positions":[2944,3456,3200,3136,4096]},
+                "servos": {"port":"/dev/ttyUSB0","baudrate":1000000,"ids":[1,2,3,4],
+                           "min_positions":[1280,1920,1120,1664], "max_positions":[2944,3456,3200,3136]},
                 "cameras": {"left":{"id":0,"width":640,"height":480}, "right":{"id":2,"width":640,"height":480}}
             }
 
     def setup_cameras(self):
         self.cameras = {}
         cam_cfg = self.config.get('cameras', {})
-        left_cfg = cam_cfg.get('cam_left', {'id':0,'enabled':True})
+        left_cfg = cam_cfg.get('cam_left', {'id':'/dev/cam_left','enabled':True})
         if left_cfg.get('enabled', True):
-            self.cameras['left'] = self._setup_single_camera('left', left_cfg.get('id', 0), left_cfg)
+            self.cameras['left'] = self._setup_single_camera('left', left_cfg.get('id', '/dev/cam_left'), left_cfg)
         else:
             self.cameras['left'] = None
-        right_cfg = cam_cfg.get('cam_right', {'id':2,'enabled':True})
+        right_cfg = cam_cfg.get('cam_right', {'id':'/dev/cam_right','enabled':True})
         if right_cfg.get('enabled', True):
-            self.cameras['right'] = self._setup_single_camera('right', right_cfg.get('id', 4), right_cfg)
+            self.cameras['right'] = self._setup_single_camera('right', right_cfg.get('id', '/dev/cam_right'), right_cfg)
         else:
             self.cameras['right'] = None
 
@@ -676,9 +705,11 @@ class ConcurrentVoiceHardwareRunner:
 
     def setup_servo_defaults(self):
         robot_cfg = self.config.get('robot_arms', {})
-        self.servo_ids = robot_cfg.get('motor_ids', [1,2,3,4,5])
-        self.min_positions = [1024,1024,1024,1024,1024]
-        self.max_positions = [2944,3456,3200,3136,2048]
+        self.servo_ids = robot_cfg.get('motor_ids', [1,2,3,4,5])  # config에 5개가 있으면 그 길이를 사용
+        if not self.servo_ids:
+            self.servo_ids = [1,2,3,4]
+        self.min_positions = self._align_len([1024,1024,1024,1024], len(self.servo_ids), 1024)
+        self.max_positions = self._align_len([2944,3456,3200,3136], len(self.servo_ids), 3072)
 
     def setup_servos(self):
         if not DynamixelSDK_available: return
@@ -690,9 +721,10 @@ class ConcurrentVoiceHardwareRunner:
         self.packet_handler = PacketHandler(robot_cfg.get('protocol_version', 2.0))
         if not self.port_handler.openPort(): raise Exception(f"Failed to open port {port}")
         if not self.port_handler.setBaudRate(baudrate): raise Exception(f"Failed to set baudrate {baudrate}")
-        self.servo_ids = robot_cfg.get('motor_ids', [1,2,3,4,5])
-        self.min_positions = [1280,1920,1120,1664,2048]
-        self.max_positions = [3072,3072,3072,3072,3072]
+        self.servo_ids = robot_cfg.get('motor_ids', [1,2,3,4])
+        if not self.servo_ids: self.servo_ids = [1,2,3,4]
+        self.min_positions = self._align_len([1280,1920,1120,1664], len(self.servo_ids), 1280)
+        self.max_positions = self._align_len([3072,3072,3072,3072], len(self.servo_ids), 3072)
         self.group_sync_write = GroupSyncWrite(self.port_handler, self.packet_handler, self.ADDR_GOAL_POSITION, 4)
 
         # Optional: set P gains from config
@@ -715,7 +747,7 @@ class ConcurrentVoiceHardwareRunner:
             self.logger.info("No Position P Gain values configured - using motor defaults")
 
         self.enable_torque()
-        self.logger.info(f"Servos initialized on {port}")
+        self.logger.info(f"Servos initialized on {port} (motors={self.servo_ids})")
 
     def enable_torque(self):
         if not DynamixelSDK_available: return
@@ -742,6 +774,8 @@ class ConcurrentVoiceHardwareRunner:
         if self.test_mode or not DynamixelSDK_available: return True
         if self.emergency_stop:
             self.logger.warning("Emergency stop active - not sending commands"); return False
+        # positions 길이를 서보 개수로 정합
+        positions = self._align_len(list(positions), len(self.servo_ids), int(np.mean(self._aligned_home_positions())))
         if self.last_sent_positions is not None:
             positions_changed = any(i >= len(self.last_sent_positions) or abs(pos - self.last_sent_positions[i]) > 1
                                     for i, pos in enumerate(positions))
@@ -749,11 +783,10 @@ class ConcurrentVoiceHardwareRunner:
         try:
             self.group_sync_write.clearParam()
             for i, servo_id in enumerate(self.servo_ids):
-                if i < len(positions):
-                    p = int(positions[i])
-                    params = [DXL_LOBYTE(DXL_LOWORD(p)), DXL_HIBYTE(DXL_LOWORD(p)),
-                              DXL_LOBYTE(DXL_HIWORD(p)), DXL_HIBYTE(DXL_HIWORD(p))]
-                    self.group_sync_write.addParam(servo_id, params)
+                p = int(positions[i])
+                params = [DXL_LOBYTE(DXL_LOWORD(p)), DXL_HIBYTE(DXL_LOWORD(p)),
+                          DXL_LOBYTE(DXL_HIWORD(p)), DXL_HIBYTE(DXL_HIWORD(p))]
+                self.group_sync_write.addParam(servo_id, params)
             dxl_comm_result = self.group_sync_write.txPacket()
             success = dxl_comm_result == COMM_SUCCESS
             if success:
@@ -772,6 +805,7 @@ class ConcurrentVoiceHardwareRunner:
 
     def clamp_positions(self, positions):
         if self.emergency_stop: return self.last_positions.copy()
+        positions = self._align_len(list(positions), len(self.servo_ids), int(np.mean(self._aligned_home_positions())))
         safe_positions = []
         for i, pos in enumerate(positions):
             mmin, mmax = self.safe_zone_min[i], self.safe_zone_max[i]
@@ -880,12 +914,20 @@ class ConcurrentVoiceHardwareRunner:
             feats = np.array(features, dtype=np.float32).reshape(1, -1)
             if self.model_type == "xgb":
                 pred = self.model.predict(feats)[0]
-                return pred if np.isfinite(pred).all() else self.last_successful_positions.copy()
-            if not np.isfinite(feats).all(): return self.last_successful_positions.copy()
-            if self.normalize and self.scaler_X is not None: feats = self.scaler_X.transform(feats)
-            with torch.no_grad(): pred = self.model(torch.FloatTensor(feats).to(self.device)).cpu().numpy()
-            if self.normalize and self.scaler_y is not None: pred = self.scaler_y.inverse_transform(pred)
-            pred = pred[0]
+            else:
+                if not np.isfinite(feats).all():
+                    return self.last_successful_positions.copy()
+                if self.normalize and self.scaler_X is not None:
+                    feats = self.scaler_X.transform(feats)
+                with torch.no_grad():
+                    pred = self.model(torch.FloatTensor(feats).to(self.device)).cpu().numpy()
+                if self.normalize and self.scaler_y is not None:
+                    pred = self.scaler_y.inverse_transform(pred)
+                pred = pred[0]
+            # 출력 길이를 서보 개수로 정합 (부족하면 홈 값, 많으면 슬라이스)
+            if len(pred) != len(self.servo_ids):
+                self.logger.warning(f"Model output_dim={len(pred)} != #servos={len(self.servo_ids)} → aligning lengths")
+            pred = self._align_len(list(pred), len(self.servo_ids), int(np.mean(self._aligned_home_positions())))
             return pred if np.isfinite(pred).all() else self.last_successful_positions.copy()
         except Exception as e:
             self.logger.error(f"Prediction error: {e}")
@@ -919,7 +961,7 @@ class ConcurrentVoiceHardwareRunner:
         if (cv2.waitKey(1) & 0xFF) == ord('q'):
             self.running = False
 
-    # ===== Voice =====
+    # ===== Voice ===== (unchanged logic)
     def _process_speech_stream(self, description: str, timeout: float, handler: Callable[[object], bool],
                                *, for_command: bool=False, timeout_message: Optional[str]=None) -> str:
         stream_ctx = None
@@ -998,9 +1040,7 @@ class ConcurrentVoiceHardwareRunner:
                         if self.arduino.in_waiting > 0:
                             try:
                                 line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
-                                # 출력은 debug일 때만
-                                if line and self.debug:
-                                    print(f"[Arduino] {line}")
+                                if line: print(f"[Arduino] {line}")
                             except Exception as e:
                                 if self.debug: self.logger.error(f"Arduino read error: {e}")
                 time.sleep(0.01)
@@ -1048,7 +1088,7 @@ class ConcurrentVoiceHardwareRunner:
             else:
                 print(f"⚠️ Arduino not connected, cannot send {arduino_cmd}")
 
-    # ===== (NEW) Reaction-time worker =====
+    # ===== Motion onset measurement =====
     def _dxl_read_present_velocity(self, servo_id: int) -> Optional[int]:
         try:
             vel, dxl_comm_result, dxl_error = self.packet_handler.read4ByteTxRx(
@@ -1071,48 +1111,34 @@ class ConcurrentVoiceHardwareRunner:
             pass
         return None
 
-    def _measure_motion_onset_worker(self, sid: int, t_capture: float,
-                                     timeout_ms: float, pos_delta_thresh: int) -> Optional[float]:
+    def _measure_motion_onset_since(self, t_capture: float) -> Optional[float]:
         """
-        워커 전용: 동기 폴링. 메인 루프는 이거 직접 호출 안 함.
+        After sending a goal, poll a representative servo until motion starts.
+        Returns reaction time in ms since t_capture, or None if timeout/unsupported.
         """
         if self.test_mode or not DynamixelSDK_available or not hasattr(self, 'packet_handler'):
             return None
-        if sid is None:
-            return None
+        if not self.servo_ids: return None
+        sid = self.servo_ids[min(self.motion_check_servo_idx, len(self.servo_ids)-1)]
+        t_end_deadline = time.perf_counter() + (self.motion_onset_timeout_ms / 1000.0)
 
-        t_end_deadline = time.perf_counter() + (timeout_ms / 1000.0)
+        # Baseline position (in case velocity is not available/non-zero-safe)
         pos0 = self._dxl_read_present_position(sid)
 
-        while time.perf_counter() < t_end_deadline and self.rt_worker_running:
+        # Fast loop: if velocity becomes non-zero OR position changes by threshold
+        while time.perf_counter() < t_end_deadline:
             vel = self._dxl_read_present_velocity(sid)
             if vel is not None and vel != 0:
                 t_onset = time.perf_counter()
                 return (t_onset - t_capture) * 1000.0
             if pos0 is not None:
                 pos = self._dxl_read_present_position(sid)
-                if pos is not None and abs(pos - pos0) >= pos_delta_thresh:
+                if pos is not None and abs(pos - pos0) >= self.motion_pos_delta_thresh:
                     t_onset = time.perf_counter()
                     return (t_onset - t_capture) * 1000.0
+            # tiny pause to avoid saturating the bus
             time.sleep(0.001)
-        return None
-
-    def _rt_worker(self):
-        """백그라운드에서만 RT 측정"""
-        while self.rt_worker_running:
-            try:
-                task = self.rt_tasks.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            # task: (t_capture, sid, timeout_ms, pos_delta)
-            t_capture, sid, timeout_ms, pos_delta = task
-            ms = self._measure_motion_onset_worker(sid, t_capture, timeout_ms, pos_delta)
-            if ms is not None:
-                try:
-                    self.rt_results.put_nowait(ms)
-                except queue.Full:
-                    # 꽉 차면 그냥 버림
-                    pass
+        return None  # timeout
 
     # ===== RT stats =====
     def _rt_record_and_maybe_print(self, ms: float):
@@ -1148,7 +1174,6 @@ class ConcurrentVoiceHardwareRunner:
 
                 self.ensure_arduino_connected()
 
-                # keepalive
                 arduino_ref = None; should_ping = False
                 if not self.test_mode:
                     with self._arduino_lock:
@@ -1188,7 +1213,7 @@ class ConcurrentVoiceHardwareRunner:
                     final_positions = self.last_positions
                     hand_detected_now = False
                 elif hand_tracking_enabled and self.model is not None:
-                    combined = left_features + right_features
+                    combined = left_features + right_features  # [cam_left_x, cam_left_y, cam_right_x, cam_right_y]
                     final_positions = self.predict_joint_positions(combined)
                     hand_detected_now = (left_detected or right_detected)
                 else:
@@ -1204,27 +1229,13 @@ class ConcurrentVoiceHardwareRunner:
                 # Send command
                 sent_ok = self.move_to_position(final_positions)
 
-                # === (NEW) RT 측정은 큐에만 넣고 끝 ===
+                # Measure only when we have: detection this frame, model enabled, cmd sent OK, and we can poll servos
                 if (self.measure_reaction_time and hand_tracking_enabled and self.model is not None and
                     hand_detected_now and t_capture is not None and sent_ok and
-                    not self.test_mode and DynamixelSDK_available and hasattr(self, 'packet_handler') and
-                    self.servo_ids):
-                    sid = self.servo_ids[min(self.motion_check_servo_idx, len(self.servo_ids)-1)]
-                    try:
-                        self.rt_tasks.put_nowait(
-                            (t_capture, sid, self.motion_onset_timeout_ms, self.motion_pos_delta_thresh)
-                        )
-                    except queue.Full:
-                        # 큐가 잠깐 꽉 찼으면 이번 거는 그냥 버린다
-                        pass
-
-                # === 워커가 측정해둔 결과 수거 ===
-                try:
-                    while True:
-                        ms = self.rt_results.get_nowait()
-                        self._rt_record_and_maybe_print(ms)
-                except queue.Empty:
-                    pass
+                    not self.test_mode and DynamixelSDK_available and hasattr(self, 'packet_handler')):
+                    rt_ms = self._measure_motion_onset_since(t_capture)
+                    if rt_ms is not None:
+                        self._rt_record_and_maybe_print(rt_ms)
 
                 # FPS control
                 elapsed = time.time() - loop_start
@@ -1240,13 +1251,10 @@ class ConcurrentVoiceHardwareRunner:
         self.logger.info("Cleaning up resources...")
         self.running = False
 
-        # RT worker stop
-        self.rt_worker_running = False
-
         if not self.test_mode and DynamixelSDK_available:
             self.logger.info("Moving servos to home position...")
             try:
-                if self.move_to_position(DEFAULT_HOME_POSITION):
+                if self.move_to_position(self._aligned_home_positions()):
                     time.sleep(1.0)
                     self.logger.info("Servos moved to home position")
                 else:

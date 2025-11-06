@@ -1,4 +1,3 @@
-
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -20,10 +19,9 @@ const float         G_CONST       = 9.80665f; // m/s^2 → g 변환
 const float HP_CUTOFF_HZ = 8.0f;              // 하한(자세/저주파 제거)
 const float LP_CUTOFF_HZ = 40.0f;             // 상한(노이즈 제거)
 
-// 점수(0~100) 매핑 기준 (g_rms: rad/s)
-//   ~0.02: 거의 정지, 0.5 이상: 눈에 띄는 떨림
-const float SCORE_S0   = 0.02f;               // 0점 기준
-const float SCORE_S100 = 0.50f;               // 100점 기준
+// 시각화 스케일 (지금은 안 써도 됨)
+const float GYRO_FULL_SCALE     = 1.0f;
+const float ARMS_FULL_SCALE_G   = 1.0f;
 
 // ===== 내부 상태 =====
 // 오프셋
@@ -43,7 +41,7 @@ float ghp_y=0, ghp_z=0;
 float glp_y=0, glp_z=0;
 float prev_gy=0, prev_gz=0;
 
-// IIR RMS (제곱 평균의 지수평활), tau ≈ 1 s
+// IIR RMS (제곱 평균의 지수평활)
 float a_rms2_iir = 0.0f;   // aRMS^2 (g^2)
 float g_rms2_iir = 0.0f;   // gRMS^2 ((rad/s)^2)
 float rms_beta   = 0.0f;   // dt/(tau+dt)
@@ -87,12 +85,12 @@ void calibrateSensors() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   delay(300);
 
   Wire.begin();
 #if defined(TWBR) || ARDUINO >= 100
-  Wire.setClock(400000); // Uno에서도 400 kHz 가능(배선 짧게)
+  Wire.setClock(400000); // I2C 400 kHz
 #endif
 
   if (!beginAuto()) {
@@ -100,21 +98,21 @@ void setup() {
     while (1) { delay(500); }
   }
 
-  // 센서 대역/범위: 100 Hz 샘플과 궁합
+  // 센서 설정
   mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   delay(150);
 
-  // 필터 계수
+  // 필터 계수 계산
   const float dt = SAMPLE_DT_MS / 1000.0f;
   const float tau_hp = 1.0f / (2.0f * M_PI * HP_CUTOFF_HZ);
   const float tau_lp = 1.0f / (2.0f * M_PI * LP_CUTOFF_HZ);
   hp_a = tau_hp / (tau_hp + dt);   // HPF: y[n]=a*(y[n-1]+x[n]-x[n-1])
   lp_b = dt / (tau_lp + dt);       // LPF: y[n]=y[n-1]+b*(x[n]-y[n-1])
 
-  // IIR RMS 시간상수 ≈ 1 s
-  const float tau_rms = 1.0f;
+  // IIR RMS 시간상수
+  const float tau_rms = 0.1f;
   rms_beta = dt / (tau_rms + dt);
 
   // 캘리브레이션
@@ -129,9 +127,8 @@ void setup() {
   Serial.print(offGY,3); Serial.print(F(", "));
   Serial.println(offGZ,3);
 
-  Serial.println(F("[READY] 흔들림 점수(0-100) / 등급 / gRMS(rad/s) / aRMS(g)"));
-  Serial.println(F("time(ms) | score  grade   gRMS    aRMS"));
-  Serial.println(F("--------------------------------------------------"));
+  // 이제부터는 주기 출력이 숫자 3개만 나올 거라고 알려주자
+  Serial.println(F("[READY] format: millis,g_rms_rad_s,a_rms_g"));
 }
 
 void loop() {
@@ -142,12 +139,12 @@ void loop() {
   sensors_event_t a, g, t;
   mpu.getEvent(&a, &g, &t);
 
-  // ----- (A) 가속도: g 단위로, 오프셋 제거 -----
+  // ----- (A) accel (g) offset 제거 -----
   float ax = a.acceleration.x / G_CONST - offAX;
   float ay = a.acceleration.y / G_CONST - offAY;
   float az = a.acceleration.z / G_CONST - offAZ;
 
-  // 1차 HPF → 1차 LPF (8–40 Hz)
+  // 밴드패스 8~40Hz
   ahp_x = hp_a * (ahp_x + ax - prev_ax);
   ahp_y = hp_a * (ahp_y + ay - prev_ay);
   ahp_z = hp_a * (ahp_z + az - prev_az);
@@ -159,11 +156,10 @@ void loop() {
 
   float amag = sqrtf(alp_x*alp_x + alp_y*alp_y + alp_z*alp_z); // g
 
-  // ----- (B) 자이로: rad/s, 오프셋 제거 -----
-  float gy = g.gyro.y - offGY;  // pitch
-  float gz = g.gyro.z - offGZ;  // yaw
+  // ----- (B) gyro (rad/s) offset 제거 -----
+  float gy = g.gyro.y - offGY;
+  float gz = g.gyro.z - offGZ;
 
-  // 1차 HPF → 1차 LPF (8–40 Hz)
   ghp_y = hp_a * (ghp_y + gy - prev_gy);
   ghp_z = hp_a * (ghp_z + gz - prev_gz);
   prev_gy = gy; prev_gz = gz;
@@ -171,7 +167,7 @@ void loop() {
   glp_y = glp_y + lp_b * (ghp_y - glp_y);
   glp_z = glp_z + lp_b * (ghp_z - glp_z);
 
-  float gmag = sqrtf(glp_y*glp_y + glp_z*glp_z);     // rad/s
+  float gmag = sqrtf(glp_y*glp_y + glp_z*glp_z); // rad/s
 
   // ----- (C) IIR RMS 업데이트 -----
   a_rms2_iir = a_rms2_iir + rms_beta * (amag*amag - a_rms2_iir);
@@ -179,36 +175,15 @@ void loop() {
   float a_rms = sqrtf(a_rms2_iir);
   float g_rms = sqrtf(g_rms2_iir);
 
-  // ----- (D) 점수/등급 -----
-  float score = 100.0f * (g_rms - SCORE_S0) / (SCORE_S100 - SCORE_S0);
-  if (score < 0) score = 0;
-  if (score > 100) score = 100;
-
-  const char* grade = "안정";
-  if      (g_rms >= 0.30f) grade = "나쁨";
-  else if (g_rms >= 0.10f) grade = "주의";
-  else if (g_rms >= 0.03f) grade = "양호";
-
-  // ----- (E) 출력 -----
+  // ----- (D) 출력: 숫자만 -----
   if (now - lastPrintMs >= PRINT_DT_MS) {
     lastPrintMs = now;
 
-    // 간단 막대(20칸) 시각화
-    int bars = (int)(score / 5.0f); // 0~20
-
-    Serial.print(now); Serial.print(F(" | "));
-
-    if (score < 100) Serial.print(' ');
-    if (score < 10)  Serial.print(' ');
-    Serial.print((int)score); Serial.print(F("    "));
-
-    Serial.print(grade); Serial.print(F("   "));
-
-    for (int i=0;i<20;i++) Serial.print(i<bars ? '#' : '.');
-    Serial.print(F("  "));
-
-    // 참고용 수치
-    Serial.print(g_rms,3); Serial.print('\t');
-    Serial.println(a_rms,3);
+    // PC 파서가 먹기 쉬운 포맷: millis,g_rms,a_rms
+    Serial.print(now);
+    Serial.print(',');
+    Serial.print(g_rms, 3);
+    Serial.print(',');
+    Serial.println(a_rms, 3);
   }
 }
