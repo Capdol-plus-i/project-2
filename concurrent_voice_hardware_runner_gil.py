@@ -107,7 +107,7 @@ COMMAND_SYNONYMS = {
     "STOP": ["스톱", "정지", "멈춰", "멈춰줘", "멈춰라"],
     #"EMERGENCY_RESET": ["리셋", "복구", "재시작", "긴급복구", "리셋해줘"],
 
-    "EXIT": ["종료", "종로"]
+    #"EXIT": ["종료", "종로"]
 }
 
 LED_COMMAND_MAP = {
@@ -301,7 +301,7 @@ def detect_cmd_interim(text: str) -> Optional[str]:
         return "TRACKING_ON"
 
     priority_commands = [
-        "EXIT", 
+        #"EXIT", 
         #"EMERGENCY_RESET", 
         "STOP", "GO_HOME",
         #"TRACKING_ON", 
@@ -380,7 +380,16 @@ class MicrophoneStream:
                     self.closed = False
                     print(f"🎤 Mic: [{device_index}] {dinfo.get('name')} @ {r} Hz, ch={ch}")
                     return self
+                except (OSError, IOError) as e:
+                    # Hardware or I/O error with this configuration
+                    if self._debug:
+                        print(f"  DEBUG: Failed to open mic with rate={r}, ch={ch}: {e}")
+                    last_err = e
+                    continue
                 except Exception as e:
+                    # Unexpected error
+                    if self._debug:
+                        print(f"  DEBUG: Unexpected error with rate={r}, ch={ch}: {e}")
                     last_err = e
                     continue
         raise RuntimeError(f"마이크 열기 실패: {last_err}")
@@ -388,13 +397,29 @@ class MicrophoneStream:
     def __exit__(self, *args):
         self.closed = True
         if self._stream:
-            try: self._stream.stop_stream()
-            except: pass
-            try: self._stream.close()
-            except: pass
-        try: self._buff.put_nowait(None)
-        except: pass
-        if self._pa: self._pa.terminate()
+            try:
+                self._stream.stop_stream()
+            except Exception as e:
+                if self._debug:
+                    print(f"  DEBUG: Failed to stop stream: {e}")
+            try:
+                self._stream.close()
+            except Exception as e:
+                if self._debug:
+                    print(f"  DEBUG: Failed to close stream: {e}")
+        try:
+            self._buff.put_nowait(None)
+        except queue.Full:
+            pass  # Queue full is acceptable here
+        except Exception as e:
+            if self._debug:
+                print(f"  DEBUG: Failed to put None to buffer: {e}")
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception as e:
+                if self._debug:
+                    print(f"  DEBUG: Failed to terminate PyAudio: {e}")
 
     def _fill_buffer(self, in_data, *_):
         try:
@@ -477,6 +502,16 @@ def hand_tracking_worker_process(camera_name, input_queue, result_queue, hand_fi
     - MediaPipe로 손 추적
     - 캐시 + 스무딩 + 데드존 + 점프 처리
     """
+    # Configure logging for this worker process
+    import logging
+    logger = logging.getLogger(f"worker.{camera_name}")
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s'))
+    logger.addHandler(handler)
+
+    logger.info(f"Hand tracking worker started for {camera_name} camera")
+
     mp_hands = mp.solutions.hands
     hands_processor = mp_hands.Hands(
         static_image_mode=False,
@@ -576,7 +611,12 @@ def hand_tracking_worker_process(camera_name, input_queue, result_queue, hand_fi
                         last_handedness = None
 
                 except Exception as e:
-                    print(f"Worker {camera_name} MediaPipe error: {e}")
+                    logger.error(f"MediaPipe processing error: {e}", exc_info=True)
+                    # Send NaN to result queue to signal error
+                    try:
+                        result_queue.put_nowait(([np.nan, np.nan], None))
+                    except queue.Full:
+                        pass  # Queue full is acceptable, will retry next frame
 
             # 1차: 캐시로 NaN 보정
             xy_final = cache_and_fill(raw_xy)
@@ -610,16 +650,16 @@ def hand_tracking_worker_process(camera_name, input_queue, result_queue, hand_fi
                 try:
                     result_queue.get_nowait()
                     result_queue.put_nowait((smoothed_xy, last_handedness))
-                except:
-                    pass
+                except (queue.Full, queue.Empty):
+                    pass  # Queue operation failed, will retry next frame
 
         except queue.Empty:
             continue
         except Exception as e:
-            print(f"Worker {camera_name} error: {e}")
+            logger.error(f"Unexpected error in worker loop: {e}", exc_info=True)
 
     hands_processor.close()
-    print(f"Worker {camera_name} shutdown")
+    logger.info(f"Hand tracking worker shutdown for {camera_name}")
 
 # MARK: - Main System Class
 
@@ -787,58 +827,66 @@ class ConcurrentVoiceHardwareRunner:
     # MARK: - Arduino Management
 
     def ensure_arduino_connected(self, force: bool = False) -> bool:
+        """
+        Ensure Arduino is connected, with thread-safe connection establishment.
+
+        Args:
+            force: If True, retry connection even if retry interval hasn't elapsed
+
+        Returns:
+            True if Arduino is connected and ready, False otherwise
+        """
         if self.test_mode:
             return False
 
         with self._arduino_lock:
+            # Check existing connection
             if self.arduino and getattr(self.arduino, "is_open", False):
                 return True
 
+            # Check retry interval
             now = time.time()
             if not force and (now - self._last_arduino_attempt) < self._arduino_retry_interval:
                 return False
 
             self._last_arduino_attempt = now
 
+            # Close any existing connection
             if self.arduino:
                 try:
                     self.arduino.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"Failed to close existing Arduino connection: {e}")
                 self.arduino = None
 
-        candidate = None
-        try:
-            ser = serial.Serial(self.arduino_port, 9600, timeout=1, write_timeout=1)
-            time.sleep(2)
+            # Attempt new connection (still under lock to prevent race condition)
             try:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-            except Exception:
-                pass
-            self.logger.info(f"✓ Arduino connected ({self.arduino_port})")
-            candidate = ser
-        except Exception as e:
-            self.logger.error(f"❌ Arduino connection failed: {e}")
-            candidate = None
+                ser = serial.Serial(self.arduino_port, 9600, timeout=1, write_timeout=1)
+                time.sleep(2)  # Arduino reset delay
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception as e:
+                    self.logger.warning(f"Failed to reset Arduino buffers: {e}")
 
-        with self._arduino_lock:
-            if candidate and getattr(candidate, "is_open", False):
-                self.arduino = candidate
+                self.arduino = ser
                 self._last_arduino_ping = time.time()
+                self.logger.info(f"✓ Arduino connected ({self.arduino_port})")
                 return True
 
-            self.arduino = None
-            self._last_arduino_ping = 0.0
-            return False
+            except Exception as e:
+                self.logger.error(f"❌ Arduino connection failed: {e}")
+                self.arduino = None
+                self._last_arduino_ping = 0.0
+                return False
 
     def _mark_arduino_disconnected(self) -> None:
         with self._arduino_lock:
             if self.arduino:
                 try:
                     self.arduino.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"Failed to close Arduino during disconnect: {e}")
             self.arduino = None
             self._last_arduino_attempt = 0.0
             self._last_arduino_ping = 0.0
