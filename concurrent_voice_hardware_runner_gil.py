@@ -347,7 +347,7 @@ class MicrophoneStream:
     def __init__(self, mic_index: Optional[int], mic_hint: str, debug: bool):
         self.mic_index = mic_index
         self.mic_hint = mic_hint
-        self.debug = debug
+        self._debug = debug
         self._pa = None
         self._stream = None
         self._buff = queue.Queue(maxsize=100)
